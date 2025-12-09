@@ -1,0 +1,36 @@
+{{- if .Values.admin }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "seaweedfs.name" . }}-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+    app.kubernetes.io/component: admin
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- if .Values.admin.annotations }}
+  annotations:
+    {{- toYaml .Values.admin.annotations | nindent 4 }}
+{{- end }}
+spec:
+  internalTrafficPolicy: {{ .Values.admin.internalTrafficPolicy | default "Cluster" }}
+  ports:
+  - name: "swfs-admin"
+    port: {{ if .Values.admin.enabled }}{{ .Values.admin.port }}{{ else }}23646{{ end }}
+    targetPort: {{ if .Values.admin.enabled }}{{ .Values.admin.port }}{{ else }}23646{{ end }}
+    protocol: TCP
+  - name: "swfs-grpc"
+    port: {{ if .Values.admin.enabled }}{{ .Values.admin.grpcPort }}{{ else }}33646{{ end }}
+    targetPort: {{ if .Values.admin.enabled }}{{ .Values.admin.grpcPort }}{{ else }}33646{{ end }}
+    protocol: TCP
+{{- if and .Values.admin.enabled .Values.admin.metricsPort }}
+  - name: "metrics"
+    port: {{ .Values.admin.metricsPort }}
+    targetPort: {{ .Values.admin.metricsPort }}
+    protocol: TCP
+{{- end }}
+  selector:
+    app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+    app.kubernetes.io/component: admin
+{{- end }}

@@ -9,7 +9,7 @@ global:
   imagePullPolicy: IfNotPresent
   imagePullSecrets: ""
   restartPolicy: Always
-  loggingLevel: 1
+  loggingLevel: 2
   enableSecurity: false
   masterServer: null
   securityConfig:
@@ -291,6 +291,81 @@ master:
     successThreshold: 2
     failureThreshold: 100
     timeoutSeconds: 10
+
+admin:
+  secret:
+    existingSecret: ""
+    userKey: ""
+    pwKey: ""
+    adminUser: "admin"
+    adminPassword: "" # if not set, no password
+  imageOverride: null
+  enabled: false
+  replicas: 1
+  ingress:
+    enabled: false
+    className: ""
+    # host: false for "*" hostname
+    host: "admin.cluster.local"
+    path: "/"
+    pathType: Prefix
+    annotations: {}
+  enableAuth: false
+
+  affinity: ""
+  tolerations: ""
+  topologySpreadConstraints: ""
+  priorityClassName: ""
+  serviceAccountName: ""
+  initContainers: ""
+  annotations: {}
+  podLabels: {}
+  podAnnotations: {}
+  podSecurityContext: {}
+  containerSecurityContext: {}
+  sidecars: []
+  extraVolumes: ""
+  extraVolumeMounts: ""
+  resources: {}
+  nodeSelector: ""
+
+  logs:
+    type: "hostPath"
+    size: ""
+    storageClass: ""
+    hostPathPrefix: /storage
+  loggingOverrideLevel: null
+  loggingLevel: 1
+
+  bindAddress: 0.0.0.0
+  port: 23646
+  grpcPort: 33646
+  # used to configure livenessProbe on admin containers
+  #
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /status
+      scheme: HTTP
+    initialDelaySeconds: 20
+    periodSeconds: 60
+    successThreshold: 1
+    failureThreshold: 20
+    timeoutSeconds: 10
+
+  # used to configure readinessProbe on admin containers
+  #
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /status
+      scheme: HTTP
+    initialDelaySeconds: 15
+    periodSeconds: 15
+    successThreshold: 1
+    failureThreshold: 100
+    timeoutSeconds: 10
+
 
 volume:
   enabled: true
@@ -1157,6 +1232,7 @@ allInOne:
   extraVolumeMounts: ""  # Additional volume mounts
   extraVolumes: ""  # Additional volumes
   initContainers: ""  # Init containers
+  podsecurityContext: ""
   sidecars: ""  # Sidecar containers
   annotations: {}  # Annotations for the deployment
   podAnnotations: {}  # Annotations for the pods

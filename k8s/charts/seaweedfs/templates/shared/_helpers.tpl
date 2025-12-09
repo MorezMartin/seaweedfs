@@ -63,6 +63,16 @@ Inject extra environment vars in the format key:value, if populated
 {{- end -}}
 {{- end -}}
 
+{{/* Return the proper master image */}}
+{{- define "admin.image" -}}
+{{- if .Values.admin.imageOverride -}}
+{{- $imageOverride := .Values.admin.imageOverride -}}
+{{- printf "%s" $imageOverride -}}
+{{- else -}}
+{{- include "common.image" . }}
+{{- end -}}
+{{- end -}}
+
 {{/* Return the proper s3 image */}}
 {{- define "s3.image" -}}
 {{- if .Values.s3.imageOverride -}}
