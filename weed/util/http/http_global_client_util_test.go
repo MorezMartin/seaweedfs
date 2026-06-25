@@ -23,11 +23,11 @@ func TestAppendQueryParameter(t *testing.T) {
 			expected: "http://example.com/3,abc?readDeleted=true",
 		},
 		{
-			name:     "with existing query",
+			name:     "proxyChunkId skips readDeleted with query",
 			rawURL:   "http://example.com/?proxyChunkId=3,abc",
 			key:      "readDeleted",
 			value:    "true",
-			expected: "http://example.com/?proxyChunkId=3,abc&readDeleted=true",
+			expected: "http://example.com/?proxyChunkId=3,abc",
 		},
 		{
 			name:     "with trailing question mark",
@@ -37,11 +37,11 @@ func TestAppendQueryParameter(t *testing.T) {
 			expected: "http://example.com/?readDeleted=true",
 		},
 		{
-			name:     "with trailing ampersand",
+			name:     "proxyChunkId skips readDeleted with trailing ampersand",
 			rawURL:   "http://example.com/?proxyChunkId=3,abc&",
 			key:      "readDeleted",
 			value:    "true",
-			expected: "http://example.com/?proxyChunkId=3,abc&readDeleted=true",
+			expected: "http://example.com/?proxyChunkId=3,abc&",
 		},
 		{
 			name:     "encodes values",

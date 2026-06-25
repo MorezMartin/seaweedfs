@@ -39,6 +39,14 @@ var (
 )
 
 func AppendQueryParameter(rawURL, key, value string) string {
+	// Skip readDeleted injection for filer proxy URLs.
+	// proxyChunkId URLs go through the filer which doesn't understand readDeleted,
+	// and after PR #10036 the filer propagates proxyChunkId to the volume server
+	// which also doesn't recognize readDeleted (it's a mount-side concept).
+	if key == "readDeleted" && strings.Contains(rawURL, "proxyChunkId") {
+		return rawURL
+	}
+
 	encoded := url.Values{key: []string{value}}.Encode()
 	fragment := ""
 	if fragmentIndex := strings.Index(rawURL, "#"); fragmentIndex >= 0 {
