@@ -56,13 +56,17 @@ func (fs *FilerServer) filerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// proxy to volume servers
-	var fileId string
+	// proxy reads (GET/HEAD) to volume servers
+	// POST/PUT uploads are handled by PostHandler below — they need the
+	// filer to assign a fileId (or use the one provided via ?fileId=) and
+	// store the chunk, rather than being proxied to a volume server where
+	// the data does not yet exist.
+	var proxyFileId string
 	if r.URL.Path == "/" {
-		fileId = r.URL.Query().Get("proxyChunkId")
+		proxyFileId = r.URL.Query().Get("proxyChunkId")
 	}
-	if fileId != "" {
-		fs.proxyToVolumeServer(w, r, fileId)
+	if proxyFileId != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		fs.proxyToVolumeServer(w, r, proxyFileId)
 		stats.FilerHandlerCounter.WithLabelValues(stats.ChunkProxy).Inc()
 		stats.FilerRequestHistogram.WithLabelValues(stats.ChunkProxy).Observe(time.Since(start).Seconds())
 		return

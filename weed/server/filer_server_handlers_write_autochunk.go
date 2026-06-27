@@ -27,6 +27,12 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 	// autoChunking can be set at the command-line level or as a query param. Query param overrides command-line
 	query := r.URL.Query()
 
+	// Support ?fileId= for pre-assigned fileId uploads (e.g., replication sink with writeChunkByFiler).
+	// When set, the filer stores the chunk under this fileId instead of calling AssignVolume.
+	if fileId := query.Get("fileId"); fileId != "" {
+		so.FileId = fileId
+	}
+
 	parsedMaxMB, _ := strconv.ParseInt(query.Get("maxMB"), 10, 32)
 	maxMB := int32(parsedMaxMB)
 	if maxMB <= 0 && fs.option.MaxMB > 0 {

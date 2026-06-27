@@ -69,6 +69,10 @@ type GatewayChunkUploadRequest struct {
 	// FilerHTTPAddress is the filer host:port that proxies chunk URLs when
 	// VolumeServerAccess == "filerProxy".
 	FilerHTTPAddress string
+	// FileId is an optional pre-assigned fileId. When set, SaveGatewayDataAsChunk
+	// will store the chunk under this fileId instead of calling AssignVolume.
+	// Used by replication sink when writeChunkByFiler is enabled.
+	FileId string
 }
 
 // SaveGatewayDataAsChunk uploads the bytes in `req.Reader` as a single chunk

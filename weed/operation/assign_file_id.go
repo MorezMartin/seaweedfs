@@ -190,6 +190,7 @@ type StorageOption struct {
 	MaxFileNameLength uint32
 	Fsync             bool
 	SaveInside        bool
+	FileId            string // optional: pre-assigned fileId to use instead of calling AssignVolume
 }
 
 func (so *StorageOption) TtlString() string {
