@@ -260,8 +260,8 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 			if errors.Is(err, errChunkSizeMismatch) {
 				return fs.onCorruptChunk(key, entry, err)
 			}
-			glog.Warningf("replicate entry chunks %s: %v", key, err)
-			return nil
+			glog.Errorf("replicate entry chunks %s: %v", key, err)
+			return err
 		}
 
 		// glog.V(4).Infof("replicated %s %+v ===> %+v", key, entry.GetChunks(), replicatedChunks)
