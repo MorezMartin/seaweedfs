@@ -190,6 +190,7 @@ type StorageOption struct {
 	MaxFileNameLength uint32
 	Fsync             bool
 	SaveInside        bool
+	ProxyFileId       string // pre-assigned fileId from ?proxyChunkId= (used when uploading through filer proxy)
 }
 
 func (so *StorageOption) TtlString() string {

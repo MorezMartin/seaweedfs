@@ -437,10 +437,10 @@ func validateReplicatedReadSize(sourceChunk *filer_pb.FileChunk, readSize int) e
 
 func (fs *FilerSink) buildUploadUrl(host, fileId string) string {
 	if fs.writeChunkByFiler {
-		// Upload to the filer directly with the fileId so the filer stores the
-		// chunk under the pre-assigned fileId instead of calling AssignVolume.
-		// The ?fileId= param is read by autoChunk → set on StorageOption.
-		return fmt.Sprintf("http://%s/?fileId=%s", fs.address, fileId)
+		// Upload chunks directly to the Filer via proxyChunkId, mirroring
+		// weed mount / gateway upload behaviour. This bypasses gRPC PutChunk
+		// to Volume Servers entirely.
+		return fmt.Sprintf("http://%s/?proxyChunkId=%s", fs.address, fileId)
 	}
 	return fmt.Sprintf("http://%s/%s", host, fileId)
 }
