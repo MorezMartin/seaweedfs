@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -201,69 +200,72 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 	dataReader := util.NewBytesReader(data)
 
 	// When ?preAssignedFileId= is present (from filer_sync upload via Filer HTTP),
-	// skip the normal assign-then-upload flow and store the chunk directly under
-	// the pre-assigned fileId. This avoids the double-assign problem:
-	//   1. UploadWithRetry already called AssignVolume and received fileId X
-	//   2. autoChunk would call AssignVolume again and get fileId Y
-	//   3. Chunk stored under Y, but entry points to X → file invisible
+	// the fileId was already assigned by UploadWithRetry on the replication source.
+	// We must NOT call assignNewFileInfo again (that would call AssignVolume gRPC
+	// and return a NEW fileId Y with a JWT for Y, but we upload the chunk to the
+	// pre-assigned fileId X → wrong jwt).
 	//
-	// Instead we still call assignNewFileInfo to discover the volume-server host,
-	// but we upload to the *pre-assigned* fileId, keeping everything in sync.
+	// Instead we generate a JWT for the pre-assigned fileId using our own signing
+	// key and upload directly to the volume server. We discover the volume server
+	// URL via GetLookupFileIdFunction().
 	query := r.URL.Query()
 	preAssignedFileId := query.Get("preAssignedFileId")
 	if preAssignedFileId != "" {
-		var uploadResult *operation.UploadResult
-		var uploadErr error
-		var urlLocation string
-		var auth security.EncodedJwt
+		// Discover which volume server hosts fileId X
+		vsUrls, lookupErr := fs.filer.MasterClient.GetLookupFileIdFunction()(ctx, preAssignedFileId)
+		if lookupErr != nil || len(vsUrls) == 0 {
+			// Fallback: the Master doesn't know about this fileId yet — fall
+			// through to normal assign flow.
+			glog.V(1).InfofCtx(ctx, "preAssignedFileId %s lookup failed, falling back: %v", preAssignedFileId, lookupErr)
+		} else {
+			// Generate a JWT for fileId X using our own signing key
+			auth := security.GenJwtForVolumeServer(
+				fs.volumeGuard.ReadSigningKey(),
+				fs.volumeGuard.ReadExpiresAfterSec(),
+				preAssignedFileId,
+			)
 
-		err := util.Retry("proxyChunkUpload", func() error {
-			// Discover volume server host via AssignVolume (we ignore the returned
-			// fileId and use the pre-assigned one instead).
-			_, urlLocation, auth, uploadErr = fs.assignNewFileInfo(ctx, so, uint64(len(data)))
-			if uploadErr != nil {
-				return uploadErr
-			}
-			// urlLocation is "http://{vs}/{fileId}" — replace the fileId with our
-			// pre-assigned one so the chunk lands under the expected id.
-			baseUrl := urlLocation[:strings.LastIndex(urlLocation, "/")+1]
-			urlLocation = baseUrl + preAssignedFileId
+			// Upload directly to the volume server at http://volume/X
+			var uploadResult *operation.UploadResult
+			var uploadErr error
 
-			uploadOption := &operation.UploadOption{
-				UploadUrl:         urlLocation,
-				Filename:          fileName,
-				Cipher:            fs.option.Cipher,
-				IsInputCompressed: false,
-				MimeType:          contentType,
-				PairMap:           nil,
-				Jwt:               auth,
+			err := util.Retry("preAssignedChunkUpload", func() error {
+				uploadOption := &operation.UploadOption{
+					UploadUrl:         vsUrls[0] + "/" + preAssignedFileId,
+					Filename:          fileName,
+					Cipher:            fs.option.Cipher,
+					IsInputCompressed: false,
+					MimeType:          contentType,
+					PairMap:           nil,
+					Jwt:               security.EncodedJwt(auth),
+				}
+
+				uploader, uploaderErr := operation.NewUploader()
+				if uploaderErr != nil {
+					return uploaderErr
+				}
+
+				uploadCtx := context.WithoutCancel(ctx)
+				uploadResult, uploadErr, _ = uploader.Upload(uploadCtx, dataReader, uploadOption)
+				if uploadErr != nil {
+					return uploadErr
+				}
+				return nil
+			})
+			if err != nil {
+				glog.ErrorfCtx(ctx, "pre-assigned chunk upload error: %v", err)
+				return nil, err
 			}
 
-			uploader, uploaderErr := operation.NewUploader()
-			if uploaderErr != nil {
-				return uploaderErr
+			if uploadResult.Size == 0 {
+				return nil, nil
 			}
 
-			uploadCtx := context.WithoutCancel(ctx)
-			uploadResult, uploadErr, _ = uploader.Upload(uploadCtx, dataReader, uploadOption)
-			if uploadErr != nil {
-				return uploadErr
-			}
-			return nil
-		})
-		if err != nil {
-			glog.ErrorfCtx(ctx, "proxy chunk upload error: %v", err)
-			return nil, err
+			fid, _ := filer_pb.ToFileIdObject(preAssignedFileId)
+			chunk := uploadResult.ToPbFileChunk(preAssignedFileId, chunkOffset, time.Now().UnixNano())
+			chunk.Fid = fid
+			return []*filer_pb.FileChunk{chunk}, nil
 		}
-
-		if uploadResult.Size == 0 {
-			return nil, nil
-		}
-
-		fid, _ := filer_pb.ToFileIdObject(preAssignedFileId)
-		chunk := uploadResult.ToPbFileChunk(preAssignedFileId, chunkOffset, time.Now().UnixNano())
-		chunk.Fid = fid
-		return []*filer_pb.FileChunk{chunk}, nil
 	}
 
 	// Normal path: assign a new fileId and upload to volume server
