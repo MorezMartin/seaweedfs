@@ -45,6 +45,7 @@ type UploadOption struct {
 	BytesBuffer       *bytes.Buffer
 	SourceUrl         string // optional: for logging when reading from a remote source
 	MaxAttempts       int    // <=0 uses the default
+	NoJwt             bool   // when true, do not send the JWT in the HTTP Authorization header (used when upload is to the filer HTTP, not a volume server)
 }
 
 type UploadResult struct {
@@ -457,7 +458,7 @@ func (uploader *Uploader) upload_content(ctx context.Context, fillBufferFunction
 	for k, v := range option.PairMap {
 		req.Header.Set(k, v)
 	}
-	if option.Jwt != "" {
+	if option.Jwt != "" && !option.NoJwt {
 		req.Header.Set("Authorization", security.BearerPrefix+string(option.Jwt))
 	}
 

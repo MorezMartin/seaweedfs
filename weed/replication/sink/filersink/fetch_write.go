@@ -199,13 +199,13 @@ func (fs *FilerSink) uploadManifestChunk(path string, sourceMtimeNs int64, sourc
 				Path:        path,
 			},
 			&operation.UploadOption{
-				Filename:          "",
-				Cipher:            false,
-				IsInputCompressed: false,
-				MimeType:          "application/octet-stream",
-				PairMap:           nil,
-				RetryForever:      false,
-			},
+							Filename:          "",
+							Cipher:            false,
+							IsInputCompressed: false,
+							MimeType:          "application/octet-stream",
+							PairMap:           nil,
+							RetryForever:      false,
+						},
 			func(host, fileId string) string {
 				return fs.buildUploadUrl(host, fileId)
 			},
@@ -437,7 +437,10 @@ func validateReplicatedReadSize(sourceChunk *filer_pb.FileChunk, readSize int) e
 
 func (fs *FilerSink) buildUploadUrl(host, fileId string) string {
 	if fs.writeChunkByFiler {
-		return fmt.Sprintf("http://%s/", fs.address)
+		// Upload to the filer directly with the fileId so the filer stores the
+		// chunk under the pre-assigned fileId instead of calling AssignVolume.
+		// The ?fileId= param is read by autoChunk → set on StorageOption.
+		return fmt.Sprintf("http://%s/?fileId=%s", fs.address, fileId)
 	}
 	return fmt.Sprintf("http://%s/%s", host, fileId)
 }
