@@ -32,7 +32,6 @@ import (
 
 type UploadOption struct {
 	UploadUrl         string
-	FilerFileId       string // optional: when set, tells the filer to store the chunk under this pre-assigned fileId (used by replication sink)
 	Filename          string
 	Cipher            bool
 	IsInputCompressed bool

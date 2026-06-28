@@ -437,11 +437,7 @@ func validateReplicatedReadSize(sourceChunk *filer_pb.FileChunk, readSize int) e
 
 func (fs *FilerSink) buildUploadUrl(host, fileId string) string {
 	if fs.writeChunkByFiler {
-		// Upload to the filer directly with the fileId so it stores the chunk
-		// under the pre-assigned fileId (from AssignVolume) instead of calling
-		// AssignVolume again. The ?fileId= param is read by autoChunk → set on
-		// StorageOption → used by dataToChunkWithSSE.
-		return fmt.Sprintf("http://%s/?fileId=%s", fs.address, fileId)
+		return fmt.Sprintf("http://%s/", fs.address)
 	}
 	return fmt.Sprintf("http://%s/%s", host, fileId)
 }

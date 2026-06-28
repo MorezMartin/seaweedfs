@@ -18,7 +18,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -208,42 +207,8 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 	var failedFileChunks []*filer_pb.FileChunk
 
 	err := util.Retry("filerDataToChunk", func() error {
-		// If a pre-assigned fileId is provided (e.g., from replication sink),
-		// use it directly and look up the auth token instead of calling AssignVolume.
-		if so.FileId != "" {
-			fileId = so.FileId
-			// Look up the volume server location and auth token from the master
-			fileLocs, locErr := fs.filer.MasterClient.GetLookupFileIdFunction()(ctx, fileId)
-			if locErr != nil || len(fileLocs) == 0 {
-				glog.V(4).InfofCtx(ctx, "fileId %s not found, retrying: %v", fileId, locErr)
-				return locErr
-			}
-			// Pick the first location
-			urlLocation = fileLocs[0]
-			// Get auth token for the fileId by calling master LookupVolume
-			var token string
-			if lerr := fs.filer.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-				resp, lerr := client.LookupVolume(context.Background(), &master_pb.LookupVolumeRequest{
-					VolumeOrFileIds: []string{fileId},
-				})
-				if lerr != nil {
-					return lerr
-				}
-				for _, vidLoc := range resp.VolumeIdLocations {
-					if vidLoc.VolumeOrFileId == fileId && len(vidLoc.Auth) > 0 {
-						token = string(vidLoc.Auth)
-						break
-					}
-				}
-				return nil
-			}); lerr != nil {
-				glog.V(4).InfofCtx(ctx, "failed to lookup auth for fileId %s: %v", fileId, lerr)
-			}
-			auth = security.EncodedJwt(token)
-		} else {
-			// assign one file id for one chunk
-			fileId, urlLocation, auth, uploadErr = fs.assignNewFileInfo(ctx, so, uint64(len(data)))
-		}
+		// assign one file id for one chunk
+		fileId, urlLocation, auth, uploadErr = fs.assignNewFileInfo(ctx, so, uint64(len(data)))
 		if uploadErr != nil {
 			glog.V(4).InfofCtx(ctx, "retry later due to assign error: %v", uploadErr)
 			stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssignRetry).Inc()
