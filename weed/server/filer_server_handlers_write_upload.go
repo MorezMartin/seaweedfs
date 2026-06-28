@@ -219,13 +219,6 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 			// through to normal assign flow.
 			glog.V(1).InfofCtx(ctx, "preAssignedFileId %s lookup failed, falling back: %v", preAssignedFileId, lookupErr)
 		} else {
-			// Generate a JWT for fileId X using our own signing key
-			auth := security.GenJwtForVolumeServer(
-				fs.volumeGuard.ReadSigningKey(),
-				fs.volumeGuard.ReadExpiresAfterSec(),
-				preAssignedFileId,
-			)
-
 			// vsUrls[0] returns "http://volume:8080/180,1822c9cd2f5b0e" (comma-separated).
 			// The volume server expects "http://volume:8080/180/1822c9cd2f5b0e" (slash-separated).
 			// Extract the host and rebuild the path with '/' instead of ','.
@@ -233,6 +226,14 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 			stripIdx := strings.LastIndex(fullUrl, "/")
 			volumeHost := fullUrl[:stripIdx]
 			slashFileId := strings.Replace(preAssignedFileId, ",", "/", 1)
+
+			// The JWT Fid claim must use slash-separated format to match the
+			// volume server's parsing of the URL path (fid = vid/fid).
+			jwtAuth := security.GenJwtForVolumeServer(
+				fs.volumeGuard.ReadSigningKey(),
+				fs.volumeGuard.ReadExpiresAfterSec(),
+				slashFileId,
+			)
 
 			// Upload directly to the volume server at http://volume/vid/fid
 			var uploadResult *operation.UploadResult
@@ -246,7 +247,7 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 					IsInputCompressed: false,
 					MimeType:          contentType,
 					PairMap:           nil,
-					Jwt:               security.EncodedJwt(auth),
+					Jwt:               security.EncodedJwt(jwtAuth),
 				}
 
 				uploader, uploaderErr := operation.NewUploader()
