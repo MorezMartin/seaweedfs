@@ -231,7 +231,7 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 
 			err := util.Retry("preAssignedChunkUpload", func() error {
 				uploadOption := &operation.UploadOption{
-					UploadUrl:         vsUrls[0] + "/" + preAssignedFileId,
+					UploadUrl:         vsUrls[0],
 					Filename:          fileName,
 					Cipher:            fs.option.Cipher,
 					IsInputCompressed: false,
