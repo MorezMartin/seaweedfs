@@ -226,20 +226,21 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 				preAssignedFileId,
 			)
 
-			// vsUrls[0] already includes the fileId (e.g. "http://volume:8080/fileId").
-			// The volume server expects just the host (without fileId) and adds it.
-			// So extract the host and re-append the fileId to avoid doubling.
+			// vsUrls[0] returns "http://volume:8080/180,1822c9cd2f5b0e" (comma-separated).
+			// The volume server expects "http://volume:8080/180/1822c9cd2f5b0e" (slash-separated).
+			// Extract the host and rebuild the path with '/' instead of ','.
 			fullUrl := vsUrls[0]
 			stripIdx := strings.LastIndex(fullUrl, "/")
 			volumeHost := fullUrl[:stripIdx]
+			slashFileId := strings.Replace(preAssignedFileId, ",", "/", 1)
 
-			// Upload directly to the volume server at http://volume/X
+			// Upload directly to the volume server at http://volume/vid/fid
 			var uploadResult *operation.UploadResult
 			var uploadErr error
 
 			err := util.Retry("preAssignedChunkUpload", func() error {
 				uploadOption := &operation.UploadOption{
-					UploadUrl:         volumeHost + "/" + preAssignedFileId,
+					UploadUrl:         volumeHost + "/" + slashFileId,
 					Filename:          fileName,
 					Cipher:            fs.option.Cipher,
 					IsInputCompressed: false,
