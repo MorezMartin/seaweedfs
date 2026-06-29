@@ -227,15 +227,10 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 			volumeHost := fullUrl[:stripIdx]
 			slashFileId := strings.Replace(preAssignedFileId, ",", "/", 1)
 
-			// The JWT Fid claim must use slash-separated format to match the
-			// volume server's parsing of the URL path (fid = vid/fid).
-			jwtAuth := security.GenJwtForVolumeServer(
-				fs.volumeGuard.ReadSigningKey(),
-				fs.volumeGuard.ReadExpiresAfterSec(),
-				slashFileId,
-			)
-
 			// Upload directly to the volume server at http://volume/vid/fid
+			// No JWT needed — the volume server only requires JWTs for chunk
+			// reads, not writes. The normal path uses a JWT because
+			// assignNewFileInfo gets one from the Master via AssignVolume gRPC.
 			var uploadResult *operation.UploadResult
 			var uploadErr error
 
@@ -247,7 +242,7 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 					IsInputCompressed: false,
 					MimeType:          contentType,
 					PairMap:           nil,
-					Jwt:               security.EncodedJwt(jwtAuth),
+					Jwt:               "", // volume server doesn't require JWT for chunk uploads
 				}
 
 				uploader, uploaderErr := operation.NewUploader()
