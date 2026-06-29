@@ -9,12 +9,10 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-
-	"slices"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -200,78 +198,11 @@ func (fs *FilerServer) doUpload(ctx context.Context, urlLocation string, limited
 func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, fileName, contentType string, data []byte, chunkOffset int64, so *operation.StorageOption) ([]*filer_pb.FileChunk, error) {
 	dataReader := util.NewBytesReader(data)
 
-	// When ?preAssignedFileId= is present (from filer_sync upload via Filer HTTP),
-	// the fileId was already assigned by UploadWithRetry on the replication source.
-	// We must NOT call assignNewFileInfo again (that would call AssignVolume gRPC
-	// and return a NEW fileId Y with a JWT for Y, but we upload the chunk to the
-	// pre-assigned fileId X → wrong jwt).
-	//
-	// Instead we generate a JWT for the pre-assigned fileId using our own signing
-	// key and upload directly to the volume server. We discover the volume server
-	// URL via GetLookupFileIdFunction().
-	query := r.URL.Query()
-	preAssignedFileId := query.Get("preAssignedFileId")
-	if preAssignedFileId != "" {
-		// Discover which volume server hosts fileId X
-		vsUrls, lookupErr := fs.filer.MasterClient.GetLookupFileIdFunction()(ctx, preAssignedFileId)
-		if lookupErr != nil || len(vsUrls) == 0 {
-			// Fallback: the Master doesn't know about this fileId yet — fall
-			// through to normal assign flow.
-			glog.V(1).InfofCtx(ctx, "preAssignedFileId %s lookup failed, falling back: %v", preAssignedFileId, lookupErr)
-		} else {
-			// vsUrls[0] returns "http://volume:8080/180,1822c9cd2f5b0e" (comma-separated).
-			// The volume server expects "http://volume:8080/180/1822c9cd2f5b0e" (slash-separated).
-			// Extract the host and rebuild the path with '/' instead of ','.
-			fullUrl := vsUrls[0]
-			stripIdx := strings.LastIndex(fullUrl, "/")
-			volumeHost := fullUrl[:stripIdx]
-			slashFileId := strings.Replace(preAssignedFileId, ",", "/", 1)
-
-			// Upload directly to the volume server at http://volume/vid/fid
-			// No JWT needed — the volume server only requires JWTs for chunk
-			// reads, not writes. The normal path uses a JWT because
-			// assignNewFileInfo gets one from the Master via AssignVolume gRPC.
-			var uploadResult *operation.UploadResult
-			var uploadErr error
-
-			err := util.Retry("preAssignedChunkUpload", func() error {
-				uploadOption := &operation.UploadOption{
-					UploadUrl:         volumeHost + "/" + slashFileId,
-					Filename:          fileName,
-					Cipher:            fs.option.Cipher,
-					IsInputCompressed: false,
-					MimeType:          contentType,
-					PairMap:           nil,
-					Jwt:               "", // volume server doesn't require JWT for chunk uploads
-				}
-
-				uploader, uploaderErr := operation.NewUploader()
-				if uploaderErr != nil {
-					return uploaderErr
-				}
-
-				uploadCtx := context.WithoutCancel(ctx)
-				uploadResult, uploadErr, _ = uploader.Upload(uploadCtx, dataReader, uploadOption)
-				if uploadErr != nil {
-					return uploadErr
-				}
-				return nil
-			})
-			if err != nil {
-				glog.ErrorfCtx(ctx, "pre-assigned chunk upload error: %v", err)
-				return nil, err
-			}
-
-			if uploadResult.Size == 0 {
-				return nil, nil
-			}
-
-			fid, _ := filer_pb.ToFileIdObject(preAssignedFileId)
-			chunk := uploadResult.ToPbFileChunk(preAssignedFileId, chunkOffset, time.Now().UnixNano())
-			chunk.Fid = fid
-			return []*filer_pb.FileChunk{chunk}, nil
-		}
-	}
+	// Note: preAssignedFileId is ignored for uploads on the destination cluster.
+	// The source's fileId has no meaning on the destination — we must assign
+	// a new fileId via assignNewFileInfo() so the Master returns a valid
+	// fileId, volume server URL, and JWT that all match.
+	_ = r.URL.Query().Get("preAssignedFileId")
 
 	// Normal path: assign a new fileId and upload to volume server
 	var fileId, urlLocation string
