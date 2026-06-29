@@ -9,8 +9,10 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,51 +200,103 @@ func (fs *FilerServer) doUpload(ctx context.Context, urlLocation string, limited
 func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, fileName, contentType string, data []byte, chunkOffset int64, so *operation.StorageOption) ([]*filer_pb.FileChunk, error) {
 	dataReader := util.NewBytesReader(data)
 
-	// Note: preAssignedFileId is ignored for uploads on the destination cluster.
-	// The source's fileId has no meaning on the destination — we must assign
-	// a new fileId via assignNewFileInfo() so the Master returns a valid
-	// fileId, volume server URL, and JWT that all match.
-	_ = r.URL.Query().Get("preAssignedFileId")
-
-	// Normal path: assign a new fileId and upload to volume server
+	// When preAssignedFileId is present (e.g. from filer_sync replication),
+	// use it directly instead of calling assignNewFileInfo. This avoids the
+	// double-AssignVolume problem: UploadWithRetry already called AssignVolume
+	// on the destination and got fileId Y. If we call assignNewFileInfo again
+	// we get a NEW fileId Z, the chunk is stored under Z, but the metadata
+	// references Y → the file becomes invisible.
+	//
+	// The filer's volumeGuard can mint valid JWTs for any fileId, so we
+	// generate a JWT for the pre-assigned fileId, look up the volume server
+	// URL, and upload directly — keeping the metadata and storage in sync.
+	preAssignedFileId := r.URL.Query().Get("preAssignedFileId")
 	var fileId, urlLocation string
 	var auth security.EncodedJwt
 	var uploadErr error
 	var uploadResult *operation.UploadResult
 	var failedFileChunks []*filer_pb.FileChunk
 
-	err := util.Retry("filerDataToChunk", func() error {
-		// assign one file id for one chunk
-		fileId, urlLocation, auth, uploadErr = fs.assignNewFileInfo(ctx, so, uint64(len(data)))
-		if uploadErr != nil {
-			glog.V(4).InfofCtx(ctx, "retry later due to assign error: %v", uploadErr)
-			stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssignRetry).Inc()
-			return uploadErr
+	if preAssignedFileId != "" {
+		// Upload to the pre-assigned fileId — skip AssignVolume entirely.
+		slashFileId := strings.Replace(preAssignedFileId, ",", "/", 1)
+
+		// Lookup the volume server URL for this fileId.
+		vsUrls, lookupErr := fs.filer.MasterClient.GetLookupFileIdFunction()(ctx, preAssignedFileId)
+		if lookupErr != nil || len(vsUrls) == 0 {
+			err := fmt.Errorf("lookup volume server for preAssignedFileId %s: %v", preAssignedFileId, lookupErr)
+			glog.ErrorfCtx(ctx, "upload error: %v", err)
+			return nil, err
 		}
-		if fileId == "" {
-			return fmt.Errorf("no fileId returned")
+
+		// Extract the host (strip "http://volume:8080/vid,fid" → "volume:8080")
+		parsed, err := url.Parse(vsUrls[0])
+		if err != nil {
+			err := fmt.Errorf("parse volume server URL %s: %v", vsUrls[0], err)
+			glog.ErrorfCtx(ctx, "upload error: %v", err)
+			return nil, err
 		}
+		volumeHost := parsed.Host
+
+		// Generate a JWT for the pre-assigned fileId using the filer's signing key.
+		// The filer's volumeGuard can mint valid JWTs for any fileId.
+		auth = security.GenJwtForVolumeServer(
+			fs.volumeGuard.ReadSigningKey(),
+			fs.volumeGuard.ReadExpiresAfterSec(),
+			slashFileId,
+		)
+		urlLocation = "http://" + volumeHost + "/" + slashFileId
+
+		// Upload directly to the volume server (no retry loop needed —
+		// the fileId was already assigned by the source side).
 		chunkMd5 := md5.Sum(data)
 		chunkMd5B64 := base64.StdEncoding.EncodeToString(chunkMd5[:])
-		// upload the chunk to the volume server
 		uploadResult, uploadErr, _ = fs.doUpload(ctx, urlLocation, dataReader, fileName, contentType, nil, auth, chunkMd5B64)
 		if uploadErr != nil {
-			glog.V(4).InfofCtx(ctx, "retry later due to upload error: %v", uploadErr)
-			stats.FilerHandlerCounter.WithLabelValues(stats.ChunkDoUploadRetry).Inc()
-			fid, _ := filer_pb.ToFileIdObject(fileId)
+			glog.V(4).InfofCtx(ctx, "upload error: %v", uploadErr)
+			fid, _ := filer_pb.ToFileIdObject(preAssignedFileId)
 			fileChunk := filer_pb.FileChunk{
-				FileId: fileId,
+				FileId: preAssignedFileId,
 				Offset: chunkOffset,
 				Fid:    fid,
 			}
 			failedFileChunks = append(failedFileChunks, &fileChunk)
-			return uploadErr
 		}
-		return nil
-	})
-	if err != nil {
-		glog.ErrorfCtx(ctx, "upload error: %v", err)
-		return failedFileChunks, err
+	} else {
+		// Normal path: assign a new fileId and upload to volume server
+		err := util.Retry("filerDataToChunk", func() error {
+			// assign one file id for one chunk
+			fileId, urlLocation, auth, uploadErr = fs.assignNewFileInfo(ctx, so, uint64(len(data)))
+			if uploadErr != nil {
+				glog.V(4).InfofCtx(ctx, "retry later due to assign error: %v", uploadErr)
+				stats.FilerHandlerCounter.WithLabelValues(stats.ChunkAssignRetry).Inc()
+				return uploadErr
+			}
+			if fileId == "" {
+				return fmt.Errorf("no fileId returned")
+			}
+			chunkMd5 := md5.Sum(data)
+			chunkMd5B64 := base64.StdEncoding.EncodeToString(chunkMd5[:])
+			// upload the chunk to the volume server
+			uploadResult, uploadErr, _ = fs.doUpload(ctx, urlLocation, dataReader, fileName, contentType, nil, auth, chunkMd5B64)
+			if uploadErr != nil {
+				glog.V(4).InfofCtx(ctx, "retry later due to upload error: %v", uploadErr)
+				stats.FilerHandlerCounter.WithLabelValues(stats.ChunkDoUploadRetry).Inc()
+				fid, _ := filer_pb.ToFileIdObject(fileId)
+				fileChunk := filer_pb.FileChunk{
+					FileId: fileId,
+					Offset: chunkOffset,
+					Fid:    fid,
+				}
+				failedFileChunks = append(failedFileChunks, &fileChunk)
+				return uploadErr
+			}
+			return nil
+		})
+		if err != nil {
+			glog.ErrorfCtx(ctx, "upload error: %v", err)
+			return failedFileChunks, err
+		}
 	}
 
 	// if last chunk exhausted the reader exactly at the border
