@@ -55,7 +55,6 @@ type FilerSink struct {
 	dataCenter        string
 	grpcDialOption    grpc.DialOption
 	address           string
-	writeChunkByFiler bool
 	isIncremental     bool
 	executor          *util.LimitedConcurrentExecutor
 	signature         int32
@@ -91,8 +90,7 @@ func (fs *FilerSink) Initialize(configuration util.Configuration, prefix string)
 		configuration.GetString(prefix+"collection"),
 		configuration.GetInt(prefix+"ttlSec"),
 		configuration.GetString(prefix+"disk"),
-		security.LoadClientTLS(util.GetViper(), "grpc.client"),
-		false)
+		security.LoadClientTLS(util.GetViper(), "grpc.client"))
 }
 
 func (fs *FilerSink) SetSourceFiler(s *source.FilerSource) {
@@ -115,7 +113,7 @@ func (fs *FilerSink) getUploader() (*operation.Uploader, error) {
 }
 
 func (fs *FilerSink) DoInitialize(address, grpcAddress string, dir string,
-	replication string, collection string, ttlSec int, diskType string, grpcDialOption grpc.DialOption, writeChunkByFiler bool) (err error) {
+	replication string, collection string, ttlSec int, diskType string, grpcDialOption grpc.DialOption) (err error) {
 	fs.address = address
 	if fs.address == "" {
 		fs.address = pb.GrpcAddressToServerAddress(grpcAddress)
@@ -127,7 +125,6 @@ func (fs *FilerSink) DoInitialize(address, grpcAddress string, dir string,
 	fs.ttlSec = int32(ttlSec)
 	fs.diskType = diskType
 	fs.grpcDialOption = grpcDialOption
-	fs.writeChunkByFiler = writeChunkByFiler
 	fs.executor = util.NewLimitedConcurrentExecutor(32)
 	return nil
 }

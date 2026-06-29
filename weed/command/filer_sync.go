@@ -103,8 +103,8 @@ func init() {
 	syncOptions.bTtlSec = cmdFilerSynchronize.Flag.Int("b.ttlSec", 0, "ttl in seconds on filer B")
 	syncOptions.aDiskType = cmdFilerSynchronize.Flag.String("a.disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag on filer A")
 	syncOptions.bDiskType = cmdFilerSynchronize.Flag.String("b.disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag on filer B")
-	syncOptions.aProxyByFiler = cmdFilerSynchronize.Flag.Bool("a.filerProxy", false, "read and write file chunks by filer A instead of volume servers")
-	syncOptions.bProxyByFiler = cmdFilerSynchronize.Flag.Bool("b.filerProxy", false, "read and write file chunks by filer B instead of volume servers")
+	syncOptions.aProxyByFiler = cmdFilerSynchronize.Flag.Bool("a.filerProxy", false, "read file chunks by filer A instead of volume servers")
+	syncOptions.bProxyByFiler = cmdFilerSynchronize.Flag.Bool("b.filerProxy", false, "read file chunks by filer B instead of volume servers")
 	syncOptions.aDebug = cmdFilerSynchronize.Flag.Bool("a.debug", false, "debug mode to print out filer A received files")
 	syncOptions.bDebug = cmdFilerSynchronize.Flag.Bool("b.debug", false, "debug mode to print out filer B received files")
 	syncOptions.aFromTsMs = cmdFilerSynchronize.Flag.Int64("a.fromTsMs", 0, "synchronization from timestamp on filer A. The unit is millisecond")
@@ -239,30 +239,29 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 		for {
 			syncOptions.clientEpoch.Add(1)
 			err := doSubscribeFilerMetaChanges(
-				syncOptions.clientId,
-				syncOptions.clientEpoch.Load(),
-				grpcDialOptionA,
-				filerA,
-				*syncOptions.aPath,
-				util.StringSplit(*syncOptions.aExcludePaths, ","),
-				*syncOptions.aProxyByFiler,
-				grpcDialOptionB,
-				filerB,
-				*syncOptions.bPath,
-				*syncOptions.bReplication,
-				*syncOptions.bCollection,
-				*syncOptions.bTtlSec,
-				*syncOptions.bProxyByFiler,
-				*syncOptions.bDiskType,
-				*syncOptions.bDebug,
-				*syncOptions.concurrency,
-				*syncOptions.chunkConcurrency,
-				*syncOptions.bDoDeleteFiles,
-				aFilerSignature,
-				bFilerSignature,
-				&syncStateA2B,
-				httpClientA,
-				httpClientB)
+					syncOptions.clientId,
+					syncOptions.clientEpoch.Load(),
+					grpcDialOptionA,
+					filerA,
+					*syncOptions.aPath,
+					util.StringSplit(*syncOptions.aExcludePaths, ","),
+					*syncOptions.aProxyByFiler,
+					grpcDialOptionB,
+					filerB,
+					*syncOptions.bPath,
+					*syncOptions.bReplication,
+					*syncOptions.bCollection,
+					*syncOptions.bTtlSec,
+					*syncOptions.bDiskType,
+					*syncOptions.bDebug,
+					*syncOptions.concurrency,
+					*syncOptions.chunkConcurrency,
+					*syncOptions.bDoDeleteFiles,
+					aFilerSignature,
+					bFilerSignature,
+					&syncStateA2B,
+					httpClientA,
+					httpClientB)
 			if err != nil {
 				glog.Errorf("sync from %s to %s: %v", *syncOptions.filerA, *syncOptions.filerB, err)
 				time.Sleep(1747 * time.Millisecond)
@@ -295,9 +294,8 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 					*syncOptions.aReplication,
 					*syncOptions.aCollection,
 					*syncOptions.aTtlSec,
-					*syncOptions.aProxyByFiler,
-					*syncOptions.aDiskType,
-					*syncOptions.aDebug,
+							*syncOptions.aDiskType,
+							*syncOptions.aDebug,
 					*syncOptions.concurrency,
 					*syncOptions.chunkConcurrency,
 					*syncOptions.aDoDeleteFiles,
@@ -334,7 +332,7 @@ func initOffsetFromTsMs(grpcDialOption grpc.DialOption, targetFiler pb.ServerAdd
 }
 
 func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDialOption grpc.DialOption, sourceFiler pb.ServerAddress, sourcePath string, sourceExcludePaths []string, sourceReadChunkFromFiler bool, targetGrpcDialOption grpc.DialOption, targetFiler pb.ServerAddress, targetPath string,
-	replicationStr, collection string, ttlSec int, sinkWriteChunkByFiler bool, diskType string, debug bool, concurrency int, chunkConcurrency int, doDeleteFiles bool, sourceFilerSignature int32, targetFilerSignature int32, statePtr *atomic.Pointer[syncState],
+	replicationStr, collection string, ttlSec int, diskType string, debug bool, concurrency int, chunkConcurrency int, doDeleteFiles bool, sourceFilerSignature int32, targetFilerSignature int32, statePtr *atomic.Pointer[syncState],
 	sourceHttpClient *util_http_client.HTTPClient, sinkHttpClient *util_http_client.HTTPClient) error {
 
 	// if first time, start from now
@@ -354,7 +352,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		filerSource.SetHttpClient(sourceHttpClient)
 	}
 	filerSink := &filersink.FilerSink{}
-	filerSink.DoInitialize(targetFiler.ToHttpAddress(), targetFiler.ToGrpcAddress(), targetPath, replicationStr, collection, ttlSec, diskType, targetGrpcDialOption, sinkWriteChunkByFiler)
+	filerSink.DoInitialize(targetFiler.ToHttpAddress(), targetFiler.ToGrpcAddress(), targetPath, replicationStr, collection, ttlSec, diskType, targetGrpcDialOption)
 	filerSink.SetChunkConcurrency(chunkConcurrency)
 	if sinkHttpClient != nil {
 		filerSink.SetUploader(operation.NewUploaderWithHttpClient(sinkHttpClient))

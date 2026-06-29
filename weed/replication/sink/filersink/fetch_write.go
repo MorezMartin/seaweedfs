@@ -436,13 +436,17 @@ func validateReplicatedReadSize(sourceChunk *filer_pb.FileChunk, readSize int) e
 }
 
 func (fs *FilerSink) buildUploadUrl(host, fileId string) string {
-	if fs.writeChunkByFiler {
-		// Upload chunks directly to the Filer via preAssignedFileId, which tells
-		// the Filer to store the chunk under the fileId already assigned by
-		// UploadWithRetry (avoiding the double-AssignVolume problem that leaves
-		// chunks and entries pointing to different fileIds).
-		return fmt.Sprintf("http://%s/?preAssignedFileId=%s", fs.address, fileId)
-	}
+	// Upload chunks directly to the volume server.
+	// UploadWithRetry already called AssignVolume on the destination filer,
+	// got back the fileId AND the volume server host. There is no need to go
+	// through the Filer with ?preAssignedFileId= (which the Filer ignores,
+	// causing a double-AssignVolume that leaves chunks and metadata
+	// pointing to different fileIds — files become invisible).
+	//
+	// Direct upload keeps it simple and matches what weed mount does:
+	//   - AssignVolume → fileId + volumeServerHost
+	//   - Upload directly to http://<volumeServerHost>/<fileId>
+	//   - Metadata references fileId, chunk lives under fileId → match ✅
 	return fmt.Sprintf("http://%s/%s", host, fileId)
 }
 
