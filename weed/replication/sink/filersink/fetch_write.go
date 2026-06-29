@@ -436,17 +436,15 @@ func validateReplicatedReadSize(sourceChunk *filer_pb.FileChunk, readSize int) e
 }
 
 func (fs *FilerSink) buildUploadUrl(host, fileId string) string {
-	// Upload chunks directly to the volume server.
-	// UploadWithRetry already called AssignVolume on the destination filer,
-	// got back the fileId AND the volume server host. There is no need to go
-	// through the Filer with ?preAssignedFileId= (which the Filer ignores,
-	// causing a double-AssignVolume that leaves chunks and metadata
-	// pointing to different fileIds — files become invisible).
-	//
-	// Direct upload keeps it simple and matches what weed mount does:
-	//   - AssignVolume → fileId + volumeServerHost
-	//   - Upload directly to http://<volumeServerHost>/<fileId>
-	//   - Metadata references fileId, chunk lives under fileId → match ✅
+	if fs.writeChunkByFiler {
+		// Upload chunks through the Filer via ?preAssignedFileId=.
+		// The Filer's dataToChunkWithSSE handles this param by looking up the
+		// volume server URL, uploading directly to it, and returning the result.
+		// This is necessary when volume servers are not directly accessible from
+		// the replication client (e.g., behind Traefik/HTTPS).
+		return fmt.Sprintf("http://%s/?preAssignedFileId=%s", fs.address, fileId)
+	}
+	// Direct upload to the volume server — matches weed mount behavior.
 	return fmt.Sprintf("http://%s/%s", host, fileId)
 }
 

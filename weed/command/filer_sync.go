@@ -257,12 +257,13 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 					*syncOptions.concurrency,
 					*syncOptions.chunkConcurrency,
 					*syncOptions.bDoDeleteFiles,
-					aFilerSignature,
-					bFilerSignature,
-					&syncStateA2B,
-					httpClientA,
-					httpClientB)
-			if err != nil {
+						aFilerSignature,
+						bFilerSignature,
+						&syncStateA2B,
+						httpClientA,
+						httpClientB,
+						*syncOptions.bProxyByFiler)
+					if err != nil {
 				glog.Errorf("sync from %s to %s: %v", *syncOptions.filerA, *syncOptions.filerB, err)
 				time.Sleep(1747 * time.Millisecond)
 			}
@@ -300,11 +301,12 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 					*syncOptions.chunkConcurrency,
 					*syncOptions.aDoDeleteFiles,
 					bFilerSignature,
-					aFilerSignature,
-					&syncStateB2A,
-					httpClientB,
-					httpClientA)
-				if err != nil {
+						aFilerSignature,
+						&syncStateB2A,
+						httpClientB,
+						httpClientA,
+						*syncOptions.aProxyByFiler)
+						if err != nil {
 					glog.Errorf("sync from %s to %s: %v", *syncOptions.filerB, *syncOptions.filerA, err)
 					time.Sleep(2147 * time.Millisecond)
 				}
@@ -333,7 +335,7 @@ func initOffsetFromTsMs(grpcDialOption grpc.DialOption, targetFiler pb.ServerAdd
 
 func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDialOption grpc.DialOption, sourceFiler pb.ServerAddress, sourcePath string, sourceExcludePaths []string, sourceReadChunkFromFiler bool, targetGrpcDialOption grpc.DialOption, targetFiler pb.ServerAddress, targetPath string,
 	replicationStr, collection string, ttlSec int, diskType string, debug bool, concurrency int, chunkConcurrency int, doDeleteFiles bool, sourceFilerSignature int32, targetFilerSignature int32, statePtr *atomic.Pointer[syncState],
-	sourceHttpClient *util_http_client.HTTPClient, sinkHttpClient *util_http_client.HTTPClient) error {
+	sourceHttpClient *util_http_client.HTTPClient, sinkHttpClient *util_http_client.HTTPClient, sinkReadChunkFromFiler bool) error {
 
 	// if first time, start from now
 	// if has previously synced, resume from that point of time
@@ -352,7 +354,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, sourceGrpcDi
 		filerSource.SetHttpClient(sourceHttpClient)
 	}
 	filerSink := &filersink.FilerSink{}
-	filerSink.DoInitialize(targetFiler.ToHttpAddress(), targetFiler.ToGrpcAddress(), targetPath, replicationStr, collection, ttlSec, diskType, targetGrpcDialOption)
+	filerSink.DoInitialize(targetFiler.ToHttpAddress(), targetFiler.ToGrpcAddress(), targetPath, replicationStr, collection, ttlSec, diskType, targetGrpcDialOption, sinkReadChunkFromFiler)
 	filerSink.SetChunkConcurrency(chunkConcurrency)
 	if sinkHttpClient != nil {
 		filerSink.SetUploader(operation.NewUploaderWithHttpClient(sinkHttpClient))
