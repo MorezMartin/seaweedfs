@@ -238,12 +238,14 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 		}
 		volumeHost := parsed.Host
 
-		// Generate a JWT for the pre-assigned fileId using the filer's signing key.
-		// The filer's volumeGuard can mint valid JWTs for any fileId.
+		// Generate a JWT for the pre-assigned fileId using the filer's write signing key.
+		// Must use SigningKey (not ReadSigningKey) because this is a write operation.
+		// Must use preAssignedFileId with comma (not slashFileId) because the volume
+		// server expects the fid claim to match "vid,fid" format.
 		auth = security.GenJwtForVolumeServer(
-			fs.volumeGuard.ReadSigningKey(),
-			fs.volumeGuard.ReadExpiresAfterSec(),
-			slashFileId,
+			fs.volumeGuard.SigningKey(),
+			fs.volumeGuard.ExpiresAfterSec(),
+			preAssignedFileId,
 		)
 		urlLocation = "http://" + volumeHost + "/" + slashFileId
 
@@ -261,6 +263,7 @@ func (fs *FilerServer) dataToChunkWithSSE(ctx context.Context, r *http.Request, 
 				Fid:    fid,
 			}
 			failedFileChunks = append(failedFileChunks, &fileChunk)
+			return failedFileChunks, uploadErr
 		}
 	} else {
 		// Normal path: assign a new fileId and upload to volume server
