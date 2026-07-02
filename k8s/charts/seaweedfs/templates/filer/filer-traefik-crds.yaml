@@ -1,0 +1,62 @@
+{{- /* ========================================================================
+     Traefik CRDs for gRPC mTLS / h2c
+     ========================================================================
+     Généré uniquement quand :
+       - className contient "traefik"
+       - global.seaweedfs.enableSecurity est activé
+
+     Ces CRDs sont nécessaires pour que Traefik puisse :
+       1. Vérifier les certificats clients entrants (TLSOption)
+       2. S'authentifier vers le backend filer en TLS (ServersTransport)
+     ========================================================================= */}}
+
+{{- $grpcEnabled := or .Values.filer.ingresses.grpc.enabled .Values.allInOne.enabled }}
+{{- $isTraefik := hasPrefix "traefik" (default "" .Values.filer.ingresses.grpc.className) }}
+{{- $securityEnabled := .Values.global.seaweedfs.enableSecurity }}
+{{- $shouldRender := and $grpcEnabled $isTraefik $securityEnabled }}
+
+{{- if $shouldRender }}
+---
+{{- /* TLSOption : Traefik vérifie le certificat du client entrant */}}
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: {{ include "seaweedfs.fullname" . }}-filer-grpc-mtls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "seaweedfs.name" . }}
+    helm.sh/chart: {{ include "seaweedfs.chart" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: filer
+    app.kubernetes.io/part-of: seaweedfs
+spec:
+  clientAuth:
+    secretNames:
+      - {{ include "seaweedfs.fullname" . }}-ca-cert
+    clientAuthType: RequireAndVerifyClientCert
+---
+{{- /* ServersTransport : Traefik s'authentifie vers le backend filer */}}
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: {{ include "seaweedfs.fullname" . }}-filer-grpc-transport
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "seaweedfs.name" . }}
+    helm.sh/chart: {{ include "seaweedfs.chart" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: filer
+    app.kubernetes.io/part-of: seaweedfs
+spec:
+  {{- /* serverName correspond au nom du service Kubernetes du filer,
+         couvert par les SAN wildcard (*.namespace.svc) du certificat filer */}}
+  {{- $backendService := ternary "all-in-one" "filer" .Values.allInOne.enabled }}
+  {{- $backendServiceName := include "seaweedfs.componentName" (list . $backendService) }}
+  serverName: {{ printf "%s.%s.svc" $backendServiceName .Release.Namespace | quote }}
+  rootCAs:
+    - secret: {{ include "seaweedfs.fullname" . }}-ca-cert
+  certificatesSecrets:
+    - {{ include "seaweedfs.fullname" . }}-client-cert
+{{- end }}
