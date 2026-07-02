@@ -12,6 +12,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
+	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/worker/types"
 	"github.com/seaweedfs/seaweedfs/weed/worker/types/base"
 	"google.golang.org/grpc"
@@ -95,19 +96,29 @@ func (t *ECBalanceTask) Execute(ctx context.Context, params *worker_pb.TaskParam
 	// Step 1: Copy shard to destination and mount
 	t.reportProgress(10.0, "Copying EC shard to destination")
 	if err := t.copyAndMountShard(ctx, params.VolumeId, sourceAddr, targetAddr, source.ShardIds, target.DiskId); err != nil {
-		return fmt.Errorf("copy and mount shard: %v", err)
+		return fmt.Errorf("copy and mount shard: %w", err)
+	}
+
+	// Step 1.5: confirm the destination actually registered the shard(s)
+	// before removing them from the source. A copy/mount RPC can return OK
+	// while the shard isn't loadable on the destination; deleting the source
+	// then would lose the shard. On a mismatch we keep the source so the
+	// scanner retries (the move is reported failed).
+	t.reportProgress(40.0, "Verifying EC shard(s) on destination")
+	if err := t.verifyShardsOnDestination(ctx, params.VolumeId, targetAddr, source.ShardIds); err != nil {
+		return err
 	}
 
 	// Step 2: Unmount shard on source
 	t.reportProgress(50.0, "Unmounting EC shard from source")
 	if err := t.unmountShard(ctx, params.VolumeId, sourceAddr, source.ShardIds); err != nil {
-		return fmt.Errorf("unmount shard on source: %v", err)
+		return fmt.Errorf("unmount shard on source: %w", err)
 	}
 
 	// Step 3: Delete shard from source
 	t.reportProgress(75.0, "Deleting EC shard from source")
 	if err := t.deleteShard(ctx, params.VolumeId, params.Collection, sourceAddr, source.ShardIds); err != nil {
-		return fmt.Errorf("delete shard on source: %v", err)
+		return fmt.Errorf("delete shard on source: %w", err)
 	}
 
 	t.reportProgress(100.0, "EC shard move complete")
@@ -120,12 +131,12 @@ func (t *ECBalanceTask) Execute(ctx context.Context, params *worker_pb.TaskParam
 func (t *ECBalanceTask) executeDedupDelete(ctx context.Context, volumeID uint32, sourceAddr pb.ServerAddress, shardIDs []uint32) error {
 	t.reportProgress(25.0, "Unmounting duplicate EC shard")
 	if err := t.unmountShard(ctx, volumeID, sourceAddr, shardIDs); err != nil {
-		return fmt.Errorf("unmount duplicate shard: %v", err)
+		return fmt.Errorf("unmount duplicate shard: %w", err)
 	}
 
 	t.reportProgress(75.0, "Deleting duplicate EC shard")
 	if err := t.deleteShard(ctx, volumeID, t.collection, sourceAddr, shardIDs); err != nil {
-		return fmt.Errorf("delete duplicate shard: %v", err)
+		return fmt.Errorf("delete duplicate shard: %w", err)
 	}
 
 	t.reportProgress(100.0, "Duplicate shard removed")
@@ -177,6 +188,25 @@ func (t *ECBalanceTask) unmountShard(ctx context.Context, volumeID uint32, addr 
 			})
 			return err
 		})
+}
+
+// verifyShardsOnDestination confirms targetAddr has registered every shard in
+// shardIDs for volumeID, so the caller can safely delete the source copies.
+func (t *ECBalanceTask) verifyShardsOnDestination(ctx context.Context, volumeID uint32, targetAddr pb.ServerAddress, shardIDs []uint32) error {
+	_, perServer := erasure_coding.VerifyShardsAcrossServers(ctx, volumeID, []string{string(targetAddr)}, t.grpcDialOption)
+	inv, ok := perServer[string(targetAddr)]
+	if !ok {
+		return fmt.Errorf("verify shard(s) on destination %s for volume %d: no inventory returned", targetAddr, volumeID)
+	}
+	if inv.QueryError != nil {
+		return fmt.Errorf("verify shard(s) on destination %s for volume %d: %v", targetAddr, volumeID, inv.QueryError)
+	}
+	for _, sid := range shardIDs {
+		if !inv.Bits.Has(erasure_coding.ShardId(sid)) {
+			return fmt.Errorf("destination %s missing EC shard %d.%d after copy/mount; keeping source", targetAddr, volumeID, sid)
+		}
+	}
+	return nil
 }
 
 // deleteShard deletes EC shards from a server

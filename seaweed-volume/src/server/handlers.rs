@@ -23,6 +23,27 @@ use crate::pb::volume_server_pb;
 use crate::storage::needle::needle::Needle;
 use crate::storage::types::*;
 
+/// Slack added over the configured file-size limit when bounding the raw
+/// request body, to allow for multipart/form-data framing overhead. The exact
+/// per-file limit is still enforced on the parsed data after multipart parsing.
+const UPLOAD_BODY_OVERHEAD: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Upper bound on bytes we will materialize in memory for a single request when
+/// expanding stored content (gzip decompression or chunk-manifest assembly).
+/// Guards against gzip bombs and crafted/oversized manifest sizes OOM-killing
+/// the server; legitimate large objects are read via client-side chunk fetches.
+const MAX_EXPANSION_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// Why `maybe_decompress_gzip` failed, so callers can distinguish a recoverable
+/// "not valid gzip, use the raw bytes" from "the bomb cap was hit, reject it".
+#[derive(Debug)]
+enum GunzipError {
+    /// Input was not valid gzip / decode failed — callers may fall back to raw.
+    Decode,
+    /// Decompressed output would exceed `MAX_EXPANSION_BYTES` — must be rejected.
+    TooLarge,
+}
+
 // ============================================================================
 // Inflight Throttle Guard
 // ============================================================================
@@ -335,10 +356,21 @@ fn parse_url_path(path: &str) -> Option<(VolumeId, NeedleId, Cookie)> {
 #[derive(Clone, Debug, Deserialize)]
 struct VolumeLocation {
     url: String,
-    #[serde(rename = "publicUrl")]
+    // Master often omits publicUrl when it matches url (Go json omitempty).
+    #[serde(rename = "publicUrl", default)]
     public_url: String,
     #[serde(rename = "grpcPort", default)]
     grpc_port: u32,
+}
+
+impl VolumeLocation {
+    fn public_or_url(&self) -> &str {
+        if self.public_url.is_empty() {
+            &self.url
+        } else {
+            &self.public_url
+        }
+    }
 }
 
 /// Master /dir/lookup response.
@@ -514,9 +546,30 @@ async fn do_replicated_request(
     .await
     .map_err(|e| format!("lookup volume failed: {}", e))?;
 
+    // Mirror Go's GetWritableRemoteReplications: reject when the master reports fewer replicas than
+    // the copy count. lookup_volume is uncached, so recovery is immediate once the replica re-registers.
+    let copy_count = {
+        let store = state.store.read().unwrap();
+        store.find_volume(VolumeId(vid)).map_or(1, |(_, v)| {
+            v.super_block.replica_placement.get_copy_count()
+        })
+    };
+    if locations.len() < copy_count as usize {
+        return Err(format!(
+            "replicating operations [{}] is less than volume {} replication copy count [{}]",
+            locations.len(),
+            vid,
+            copy_count
+        ));
+    }
+
+    let self_http = to_http_address(&state.self_url);
     let remote_locations: Vec<_> = locations
         .into_iter()
-        .filter(|loc| loc.url != state.self_url && loc.public_url != state.self_url)
+        .filter(|loc| {
+            to_http_address(&loc.url) != self_http
+                && to_http_address(loc.public_or_url()) != self_http
+        })
         .collect();
 
     if remote_locations.is_empty() {
@@ -1226,7 +1279,9 @@ async fn get_or_head_handler_inner(
             &query,
             &etag,
             &last_modified_str,
-        ) {
+        )
+        .await
+        {
             return resp;
         }
         // If manifest expansion fails (invalid JSON etc.), fall through to raw data
@@ -1452,12 +1507,16 @@ async fn get_or_head_handler_inner(
     if is_compressed {
         if needs_image_ops {
             // Always decompress for image operations (Go decompresses before resize/crop)
-            use flate2::read::GzDecoder;
-            use std::io::Read as _;
-            let mut decoder = GzDecoder::new(&data[..]);
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() {
-                data = decompressed;
+            match maybe_decompress_gzip(&data) {
+                Ok(decompressed) => data = decompressed,
+                Err(GunzipError::TooLarge) => {
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "compressed object exceeds decompression limit",
+                    )
+                        .into_response()
+                }
+                Err(GunzipError::Decode) => {} // not valid gzip; keep raw bytes
             }
         } else {
             let accept_encoding = headers
@@ -1474,12 +1533,16 @@ async fn get_or_head_handler_inner(
                 response_headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
             } else {
                 // Decompress for client
-                use flate2::read::GzDecoder;
-                use std::io::Read as _;
-                let mut decoder = GzDecoder::new(&data[..]);
-                let mut decompressed = Vec::new();
-                if decoder.read_to_end(&mut decompressed).is_ok() {
-                    data = decompressed;
+                match maybe_decompress_gzip(&data) {
+                    Ok(decompressed) => data = decompressed,
+                    Err(GunzipError::TooLarge) => {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "compressed object exceeds decompression limit",
+                        )
+                            .into_response()
+                    }
+                    Err(GunzipError::Decode) => {} // not valid gzip; keep raw bytes
                 }
             }
         }
@@ -2134,15 +2197,30 @@ pub async fn post_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Read body
-    let body = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+    // Read body, bounded by the configured file-size limit so a single upload
+    // cannot buffer unbounded memory and OOM-kill the server (mirrors Go's
+    // io.LimitReader(r.Body, sizeLimit+1)). A margin covers multipart framing;
+    // the exact per-file limit is still enforced on the parsed data below.
+    let body_limit = if state.file_size_limit_bytes > 0 {
+        // try_from (not `as usize`) so a >usize::MAX limit on 32-bit caps at
+        // usize::MAX instead of silently truncating/wrapping to a tiny value.
+        usize::try_from(state.file_size_limit_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(UPLOAD_BODY_OVERHEAD)
+    } else {
+        usize::MAX
+    };
+    let body = match axum::body::to_bytes(request.into_body(), body_limit).await {
         Ok(b) => b,
         Err(e) => {
-            return json_error_with_query(
-                StatusCode::BAD_REQUEST,
-                format!("read body: {}", e),
-                Some(&query),
-            )
+            // With a limit configured, an error here means the body exceeded it
+            // before we buffered the whole thing; report it like the size check.
+            let msg = if state.file_size_limit_bytes > 0 {
+                format!("file over the limited {} bytes", state.file_size_limit_bytes)
+            } else {
+                format!("read body: {}", e)
+            };
+            return json_error_with_query(StatusCode::BAD_REQUEST, msg, Some(&query));
         }
     };
 
@@ -2282,7 +2360,17 @@ pub async fn post_handler(
     };
 
     let uncompressed_data = if is_gzipped {
-        maybe_decompress_gzip(&body_data_raw).unwrap_or_else(|| body_data_raw.clone())
+        match maybe_decompress_gzip(&body_data_raw) {
+            Ok(d) => d,
+            Err(GunzipError::TooLarge) => {
+                return json_error_with_query(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "compressed object exceeds decompression limit",
+                    Some(&query),
+                );
+            }
+            Err(GunzipError::Decode) => body_data_raw.clone(),
+        }
     } else {
         body_data_raw.clone()
     };
@@ -2761,14 +2849,16 @@ pub async fn delete_handler(
     // If this is a chunk manifest, delete child chunks first
     if n.is_chunk_manifest() {
         let manifest_data = if n.is_compressed() {
-            use flate2::read::GzDecoder;
-            use std::io::Read as _;
-            let mut decoder = GzDecoder::new(&n.data[..]);
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() {
-                decompressed
-            } else {
-                n.data.clone()
+            match maybe_decompress_gzip(&n.data) {
+                Ok(d) => d,
+                Err(GunzipError::TooLarge) => {
+                    return json_error_with_query(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "compressed manifest exceeds decompression limit",
+                        Some(&del_query),
+                    );
+                }
+                Err(GunzipError::Decode) => n.data.clone(),
             }
         } else {
             n.data.clone()
@@ -3108,12 +3198,11 @@ struct ChunkManifest {
 struct ChunkInfo {
     fid: String,
     offset: i64,
-    #[allow(dead_code)]
     size: i64,
 }
 
 /// Try to expand a chunk manifest needle. Returns None if manifest can't be parsed.
-fn try_expand_chunk_manifest(
+async fn try_expand_chunk_manifest(
     state: &Arc<VolumeServerState>,
     n: &Needle,
     _headers: &HeaderMap,
@@ -3124,14 +3213,19 @@ fn try_expand_chunk_manifest(
     last_modified_str: &Option<String>,
 ) -> Option<Response> {
     let data = if n.is_compressed() {
-        use flate2::read::GzDecoder;
-        use std::io::Read as _;
-        let mut decoder = GzDecoder::new(&n.data[..]);
-        let mut decompressed = Vec::new();
-        if decoder.read_to_end(&mut decompressed).is_err() {
-            return None;
+        match maybe_decompress_gzip(&n.data) {
+            Ok(d) => d,
+            Err(GunzipError::TooLarge) => {
+                return Some(
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "compressed manifest exceeds decompression limit",
+                    )
+                        .into_response(),
+                )
+            }
+            Err(GunzipError::Decode) => return None,
         }
-        decompressed
     } else {
         n.data.clone()
     };
@@ -3141,29 +3235,33 @@ fn try_expand_chunk_manifest(
         Err(_) => return None,
     };
 
-    // Read and concatenate all chunks
+    // Guard the attacker-controlled manifest size before allocating: a negative
+    // value would wrap to a huge usize (capacity-overflow panic) and an oversized
+    // one would OOM-kill the server.
+    if manifest.size < 0 || manifest.size as u64 > MAX_EXPANSION_BYTES {
+        return None;
+    }
+
+    // Read and concatenate all chunks. Each chunk is resolved to wherever it
+    // lives — a local regular volume, a local EC volume (reconstruct-on-read),
+    // or a peer via master lookup — mirroring Go's ChunkedFileReader, which
+    // never assumes chunks are local regular needles.
     let mut result = vec![0u8; manifest.size as usize];
-    let store = state.store.read().unwrap();
     for chunk in &manifest.chunks {
-        let (chunk_vid, chunk_nid, chunk_cookie) = match parse_url_path(&chunk.fid) {
-            Some(p) => p,
-            None => {
-                return Some(
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("invalid chunk fid: {}", chunk.fid),
-                    )
-                        .into_response(),
+        // Validate the attacker-controlled chunk offset before indexing: a
+        // negative value would wrap to a huge usize, and an out-of-range one has
+        // nowhere to land.
+        if chunk.offset < 0 || chunk.size < 0 {
+            return Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("invalid negative chunk offset/size in {}", chunk.fid),
                 )
-            }
-        };
-        let mut chunk_needle = Needle {
-            id: chunk_nid,
-            cookie: chunk_cookie,
-            ..Needle::default()
-        };
-        match store.read_volume_needle(chunk_vid, &mut chunk_needle) {
-            Ok(_) => {}
+                    .into_response(),
+            );
+        }
+        let data = match read_chunk_needle(state, &chunk.fid).await {
+            Ok(d) => d,
             Err(e) => {
                 return Some(
                     (
@@ -3173,26 +3271,16 @@ fn try_expand_chunk_manifest(
                         .into_response(),
                 )
             }
-        }
-        let chunk_data = if chunk_needle.is_compressed() {
-            use flate2::read::GzDecoder;
-            use std::io::Read as _;
-            let mut decoder = GzDecoder::new(&chunk_needle.data[..]);
-            let mut decompressed = Vec::new();
-            if decoder.read_to_end(&mut decompressed).is_ok() {
-                decompressed
-            } else {
-                chunk_needle.data.clone()
-            }
-        } else {
-            chunk_needle.data.clone()
         };
         let offset = chunk.offset as usize;
-        let end = std::cmp::min(offset + chunk_data.len(), result.len());
-        let copy_len = end - offset;
-        if copy_len > 0 {
-            result[offset..offset + copy_len].copy_from_slice(&chunk_data[..copy_len]);
+        if offset >= result.len() {
+            continue;
         }
+        // Clamp to the chunk's declared size so an over-long chunk can't bleed
+        // into the next chunk's window; also drop bytes past the buffer end.
+        let bound = (chunk.size as usize).min(result.len() - offset);
+        let copy_len = data.len().min(bound);
+        result[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
     }
 
     // Determine filename: URL path filename, then manifest name
@@ -3336,6 +3424,136 @@ fn try_expand_chunk_manifest(
     }
 
     Some((StatusCode::OK, response_headers, result).into_response())
+}
+
+/// Read one chunk-manifest chunk's final (decompressed) content bytes from
+/// wherever it lives: a local regular volume, a local EC volume
+/// (reconstruct-on-read from surviving shards), or a peer resolved via the
+/// master. Mirrors Go's ChunkedFileReader, which looks every chunk up through
+/// the master instead of assuming a local regular needle.
+async fn read_chunk_needle(
+    state: &Arc<VolumeServerState>,
+    fid: &str,
+) -> Result<Vec<u8>, String> {
+    let (vid, nid, cookie) =
+        parse_url_path(fid).ok_or_else(|| format!("invalid chunk fid: {}", fid))?;
+
+    // Decide where the chunk lives under one store read lock; drop it before any
+    // await (the EC and remote paths are async).
+    enum Placement {
+        Ec,
+        Remote,
+    }
+    let placement = {
+        let store = state.store.read().unwrap();
+        if store.find_volume(vid).is_some() {
+            let mut n = Needle {
+                id: nid,
+                cookie,
+                ..Needle::default()
+            };
+            return store
+                .read_volume_needle(vid, &mut n)
+                .map_err(|e| format!("{}", e))
+                .and_then(|_| cookie_checked_chunk(n, cookie));
+        } else if store.find_ec_volume(vid).is_some() {
+            Placement::Ec
+        } else {
+            Placement::Remote
+        }
+    };
+
+    match placement {
+        Placement::Ec => {
+            match crate::server::store_ec::read_ec_shard_needle_distributed(state, vid, nid).await {
+                Ok(Some(n)) => cookie_checked_chunk(n, cookie),
+                Ok(None) => Err("not found".to_string()),
+                Err(e) => Err(format!("{}", e)),
+            }
+        }
+        // The peer serves through its own GET handler, which validates the cookie.
+        Placement::Remote => read_remote_chunk_needle(state, vid, fid).await,
+    }
+}
+
+/// Validate a locally-read chunk's cookie against the one in its fid, then return
+/// its content bytes. The main GET paths check the cookie after a read; a chunk
+/// read must do the same so a stale/guessed id can't serve another needle's data.
+fn cookie_checked_chunk(n: Needle, cookie: Cookie) -> Result<Vec<u8>, String> {
+    if n.cookie != cookie {
+        return Err("not found".to_string());
+    }
+    decompress_chunk(n)
+}
+
+/// Return a needle's content bytes, decompressing gzip payloads the way the read
+/// handler does for a client that did not ask for gzip.
+fn decompress_chunk(n: Needle) -> Result<Vec<u8>, String> {
+    if n.is_compressed() {
+        match maybe_decompress_gzip(&n.data) {
+            Ok(d) => Ok(d),
+            Err(GunzipError::TooLarge) => {
+                Err("compressed chunk exceeds decompression limit".to_string())
+            }
+            // Not valid gzip; keep the raw bytes, matching the prior fallback.
+            Err(GunzipError::Decode) => Ok(n.data),
+        }
+    } else {
+        Ok(n.data)
+    }
+}
+
+/// Fetch a chunk that is not hosted locally from a peer volume server. The peer
+/// serves the final (decompressed) bytes whether the chunk is on a regular or EC
+/// volume, so a chunk whose EC shards live elsewhere is still reconstructed on
+/// the holder's side. Mirrors Go's ChunkedFileReader.readChunkNeedle.
+async fn read_remote_chunk_needle(
+    state: &Arc<VolumeServerState>,
+    vid: VolumeId,
+    fid: &str,
+) -> Result<Vec<u8>, String> {
+    let locations = lookup_volume(
+        &state.http_client,
+        &state.outgoing_http_scheme,
+        &state.master_url,
+        vid.0,
+    )
+    .await?;
+    if locations.is_empty() {
+        return Err("not found".to_string());
+    }
+
+    let mut last_err = String::new();
+    for loc in &locations {
+        // Skip self: the local paths already ruled this server out.
+        if loc.url.contains(&state.self_url) {
+            continue;
+        }
+        let target_http = to_http_address(&loc.url);
+        let url = match normalize_outgoing_http_url(
+            &state.outgoing_http_scheme,
+            &format!("{}/{}?proxied=true", target_http, fid),
+        ) {
+            Ok(u) => u,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        match state.http_client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(b) => return Ok(b.to_vec()),
+                Err(e) => last_err = format!("read body from {}: {}", url, e),
+            },
+            Ok(resp) => last_err = format!("{} returned {}", url, resp.status()),
+            Err(e) => last_err = format!("request to {} failed: {}", url, e),
+        }
+    }
+    Err(if last_err.is_empty() {
+        "not found".to_string()
+    } else {
+        last_err
+    })
 }
 
 // ============================================================================
@@ -3564,13 +3782,22 @@ fn try_gzip_data(data: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-fn maybe_decompress_gzip(data: &[u8]) -> Option<Vec<u8>> {
+fn maybe_decompress_gzip(data: &[u8]) -> Result<Vec<u8>, GunzipError> {
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut decoder = GzDecoder::new(data);
+    // Cap the output so a crafted, highly-compressible (gzip-bomb) needle cannot
+    // OOM the server when decompressed on read or upload. take(limit+1) lets us
+    // tell "exactly at the limit" apart from "over it", which we reject as
+    // TooLarge so callers fail the request instead of silently using raw bytes.
+    let mut decoder = GzDecoder::new(data).take(MAX_EXPANSION_BYTES + 1);
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed).ok()?;
-    Some(decompressed)
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|_| GunzipError::Decode)?;
+    if decompressed.len() as u64 > MAX_EXPANSION_BYTES {
+        return Err(GunzipError::TooLarge);
+    }
+    Ok(decompressed)
 }
 
 fn compute_md5_base64(data: &[u8]) -> String {
@@ -3812,7 +4039,11 @@ mod tests {
         let compressed = try_gzip_data(data).unwrap();
         let decompressed = maybe_decompress_gzip(&compressed).unwrap();
         assert_eq!(decompressed, data);
-        assert!(maybe_decompress_gzip(data).is_none());
+        // Non-gzip input is reported as a decode error (callers fall back to raw).
+        assert!(matches!(
+            maybe_decompress_gzip(data),
+            Err(GunzipError::Decode)
+        ));
     }
 
     #[test]
@@ -3909,6 +4140,26 @@ mod tests {
             response.headers().get(header::LOCATION).unwrap(),
             "http://volume.internal:8080/3,01637037d6?proxied=true"
         );
+    }
+
+    /// Master /dir/lookup often omits publicUrl when empty (Go `json:"publicUrl,omitempty"`).
+    /// Replication must still parse locations or every cross-DC write fails.
+    #[test]
+    fn test_lookup_result_deserializes_without_public_url() {
+        let body = r#"{
+            "volumeOrFileId": "9",
+            "locations": [
+                {"url": "volume-a.example:8080", "dataCenter": "dc-a", "grpcPort": 18080},
+                {"url": "volume-b.example:8080", "dataCenter": "dc-b", "grpcPort": 18080}
+            ]
+        }"#;
+        let result: LookupResult = serde_json::from_str(body).expect("parse lookup JSON");
+        let locations = result.locations.expect("locations");
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].url, "volume-a.example:8080");
+        assert!(locations[0].public_url.is_empty());
+        assert_eq!(locations[0].public_or_url(), "volume-a.example:8080");
+        assert_eq!(locations[0].grpc_port, 18080);
     }
 
     /// Regression test for issue #9274.

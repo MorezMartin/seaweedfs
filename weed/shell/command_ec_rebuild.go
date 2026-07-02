@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -25,6 +28,7 @@ type ecRebuilder struct {
 	writer       io.Writer
 	applyChanges bool
 	collections  []string
+	volumeIds    []needle.VolumeId
 	diskType     types.DiskType
 
 	ewg       *ErrorWaitGroup
@@ -42,6 +46,11 @@ func (c *commandEcRebuild) Help() string {
 	return `find and rebuild missing ec shards among volume servers
 
 	ec.rebuild [-c EACH_COLLECTION|<collection_name>] [-apply] [-maxParallelization N] [-diskType=<disk_type>]
+
+	Before rebuilding, asks volume servers to recover any shards left unmounted by
+	a missing .ecx index (the index resides only on a peer server). Such shards are
+	invisible to the master, so recovering them first avoids regenerating data that
+	is actually present (issue #10104).
 
 	Options:
 	  -collection: specify a collection name, or "EACH_COLLECTION" to process all collections
@@ -84,6 +93,7 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 
 	fixCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
 	collection := fixCommand.String("collection", "EACH_COLLECTION", "collection name, or \"EACH_COLLECTION\" for each collection")
+	volumeIdsStr := fixCommand.String("volumeIds", "", "optional comma-separated list of volume ID to process; defaults to all volumes in the collection")
 	maxParallelization := fixCommand.Int("maxParallelization", DefaultMaxParallelization, "run up to X tasks in parallel, whenever possible")
 	applyChanges := fixCommand.Bool("apply", false, "apply the changes")
 	diskTypeStr := fixCommand.String("diskType", "", "disk type for EC shards (hdd, ssd, or empty for default hdd)")
@@ -117,16 +127,37 @@ func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.W
 		collections = []string{*collection}
 	}
 
+	var volumeIds []needle.VolumeId
+	if *volumeIdsStr != "" {
+		for _, vidStr := range strings.Split(*volumeIdsStr, ",") {
+			vidStr = strings.TrimSpace(vidStr)
+			if len(vidStr) == 0 {
+				continue
+			}
+			if vid, err := strconv.ParseUint(vidStr, 10, 32); err == nil {
+				volumeIds = append(volumeIds, needle.VolumeId(vid))
+			} else {
+				return fmt.Errorf("invalid volume ID %q", vidStr)
+			}
+		}
+	}
+
 	erb := &ecRebuilder{
 		commandEnv:   commandEnv,
 		ecNodes:      allEcNodes,
 		writer:       writer,
 		applyChanges: *applyChanges,
 		collections:  collections,
+		volumeIds:    volumeIds,
 		diskType:     diskType,
 
 		ewg: NewErrorWaitGroup(*maxParallelization),
 	}
+
+	// Recover shards left unmounted by a missing .ecx index before planning: such
+	// shards never register with the master, so the rebuild below would treat the
+	// volume as short or unrepairable even though its data is intact (issue #10104).
+	erb.recoverMissingIndexes()
 
 	fmt.Printf("rebuildEcVolumes for %d collection(s)\n", len(collections))
 	for _, c := range collections {
@@ -144,16 +175,28 @@ func (erb *ecRebuilder) isLocked() bool {
 	return erb.commandEnv.isLocked()
 }
 
+// matchesVolumeId verifies whether the rebuilder is targeted at a given volume ID.
+func (erb *ecRebuilder) matchesVolumeId(vid needle.VolumeId) bool {
+	if len(erb.volumeIds) == 0 {
+		return true
+	}
+
+	return slices.Contains(erb.volumeIds, vid)
+}
+
 // countLocalShards returns the number of shards already present locally on the node for the given volume.
+// Unions across all of the node's disks, like prepareDataToRecover, so slot
+// accounting matches what the rebuild will actually treat as local.
 func (erb *ecRebuilder) countLocalShards(node *EcNode, collection string, volumeId needle.VolumeId) int {
+	localShardsInfo := erasure_coding.NewShardsInfo()
 	for _, diskInfo := range node.info.DiskInfos {
 		for _, ecShardInfo := range diskInfo.EcShardInfos {
 			if ecShardInfo.Collection == collection && needle.VolumeId(ecShardInfo.Id) == volumeId {
-				return erasure_coding.GetShardCount(ecShardInfo)
+				localShardsInfo.Add(erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo))
 			}
 		}
 	}
-	return 0
+	return localShardsInfo.Count()
 }
 
 // selectAndReserveRebuilder atomically selects a rebuilder node with sufficient free slots
@@ -226,6 +269,9 @@ func (erb *ecRebuilder) rebuildEcVolumes(collection string) {
 	erb.ecNodesMu.Unlock()
 
 	for vid, locations := range ecShardMap {
+		if !erb.matchesVolumeId(vid) {
+			continue
+		}
 		shardCount := locations.shardCount()
 		if shardCount == erasure_coding.TotalShardsCount {
 			continue
@@ -252,6 +298,61 @@ func (erb *ecRebuilder) rebuildEcVolumes(collection string) {
 	}
 }
 
+// recoverMissingIndexes asks every ec node to fetch a missing .ecx index from a
+// peer and mount the on-disk shards it could not load on its own. Shards
+// orphaned this way (index only on another server) are absent from the master
+// topology, so without this pass ec.rebuild would regenerate or give up on
+// shards whose data is actually present — and a volume whose every holder lacks
+// the index would not appear in the topology at all. Each node therefore
+// recovers all of its on-disk orphans (volume_id 0); an explicit -volumeIds
+// list narrows that to the requested volumes. On apply it refreshes the topology
+// so the rebuild planning sees the recovered shards (issue #10104).
+func (erb *ecRebuilder) recoverMissingIndexes() {
+	erb.ecNodesMu.Lock()
+	nodes := append([]*EcNode(nil), erb.ecNodes...)
+	erb.ecNodesMu.Unlock()
+	if len(nodes) == 0 {
+		return
+	}
+
+	// volume_id 0 means "recover every orphan on the node"; a -volumeIds list
+	// narrows recovery to those ids (each scanned across collections server-side).
+	vids := erb.volumeIds
+	if len(vids) == 0 {
+		vids = []needle.VolumeId{0}
+	}
+
+	if !erb.applyChanges {
+		erb.write("would ask %d ec node(s) to recover EC shards left unmounted by a missing .ecx index\n", len(nodes))
+		return
+	}
+
+	for _, node := range nodes {
+		for _, vid := range vids {
+			err := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(node.info), erb.commandEnv.option.GrpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
+				_, mountErr := client.VolumeEcShardsMount(context.Background(), &volume_server_pb.VolumeEcShardsMountRequest{
+					VolumeId:            uint32(vid),
+					RecoverMissingIndex: true,
+				})
+				return mountErr
+			})
+			if err != nil {
+				erb.write("%s recover missing index (volume %d): %v\n", node.info.Id, vid, err)
+			}
+		}
+	}
+
+	// Refresh topology so the rebuild planning sees shards the recovery registered.
+	refreshed, _, err := collectEcNodes(erb.commandEnv, erb.diskType)
+	if err != nil {
+		erb.write("failed to refresh ec nodes after index recovery: %v\n", err)
+		return
+	}
+	erb.ecNodesMu.Lock()
+	erb.ecNodes = refreshed
+	erb.ecNodesMu.Unlock()
+}
+
 func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.VolumeId, locations EcShardLocations, rebuilder *EcNode) error {
 	if !erb.isLocked() {
 		return fmt.Errorf("lock is lost")
@@ -262,19 +363,22 @@ func (erb *ecRebuilder) rebuildOneEcVolume(collection string, volumeId needle.Vo
 	// collect shard files to rebuilder local disk
 	var generatedShardIds []erasure_coding.ShardId
 	copiedShardIds, _, err := erb.prepareDataToRecover(rebuilder, collection, volumeId, locations)
+	defer func() {
+		// Clean up the working copies this run actually made, even when the
+		// recoverability gate failed after some copies already succeeded:
+		// they are temp files on the rebuilder nothing else reclaims. Dry-run
+		// copies nothing (copiedShardIds is empty), so this issues no delete
+		// RPC. Use a local error so a cleanup failure cannot mask the return.
+		if !erb.applyChanges || len(copiedShardIds) == 0 {
+			return
+		}
+		if derr := sourceServerDeleteEcShards(erb.commandEnv.option.GrpcDialOption, collection, volumeId, pb.NewServerAddressFromDataNode(rebuilder.info), copiedShardIds); derr != nil {
+			erb.write("%s delete copied ec shards %s %d.%v: %v\n", rebuilder.info.Id, collection, volumeId, copiedShardIds, derr)
+		}
+	}()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		// clean up working files
-
-		// ask the rebuilder to delete the copied shards
-		err = sourceServerDeleteEcShards(erb.commandEnv.option.GrpcDialOption, collection, volumeId, pb.NewServerAddressFromDataNode(rebuilder.info), copiedShardIds)
-		if err != nil {
-			erb.write("%s delete copied ec shards %s %d.%v\n", rebuilder.info.Id, collection, volumeId, copiedShardIds)
-		}
-
-	}()
 
 	if !erb.applyChanges {
 		return nil
@@ -323,7 +427,11 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 		for _, ecShardInfo := range diskInfo.EcShardInfos {
 			if ecShardInfo.Collection == collection && needle.VolumeId(ecShardInfo.Id) == volumeId {
 				needEcxFile = false
-				localShardsInfo = erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo)
+				// Union across disks: the rebuilder may hold this volume's
+				// shards on more than one disk. Overwriting per-disk would
+				// make a shard on a non-last disk look remote and get copied
+				// onto itself (O_TRUNC) and then node-wide deleted.
+				localShardsInfo.Add(erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo))
 			}
 		}
 	}
@@ -335,6 +443,9 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 		}
 	}
 
+	// recoverableRemoteShards counts remote shards that can contribute to the
+	// rebuild. Dry-run counts the plan; apply mode counts only successful copies.
+	recoverableRemoteShards := 0
 	for i := 0; i < targetShardCount; i++ {
 		ecNodes := locations[i]
 		shardId := erasure_coding.ShardId(i)
@@ -349,38 +460,54 @@ func (erb *ecRebuilder) prepareDataToRecover(rebuilder *EcNode, collection strin
 			continue
 		}
 
-		var copyErr error
-		if erb.applyChanges {
-			copyErr = operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(rebuilder.info), erb.commandEnv.option.GrpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				_, copyErr := volumeServerClient.VolumeEcShardsCopy(context.Background(), &volume_server_pb.VolumeEcShardsCopyRequest{
-					VolumeId:       uint32(volumeId),
-					Collection:     collection,
-					ShardIds:       []uint32{uint32(shardId)},
-					CopyEcxFile:    needEcxFile,
-					CopyEcjFile:    true,
-					CopyVifFile:    needEcxFile,
-					SourceDataNode: ecNodes[0].info.Id,
-				})
-				return copyErr
-			})
-			if copyErr == nil && needEcxFile {
-				needEcxFile = false
-			}
+		// The rebuilder is itself the only listed holder: never copy a shard
+		// onto itself (the in-place O_TRUNC would destroy it) nor schedule it
+		// for the post-rebuild delete. Treat it as already local.
+		if ecNodes[0].info.Id == rebuilder.info.Id {
+			localShardIds = append(localShardIds, shardId)
+			erb.write("use existing shard %d.%d (already on rebuilder)\n", volumeId, shardId)
+			continue
 		}
+
+		if !erb.applyChanges {
+			recoverableRemoteShards++
+			erb.write("would copy %d.%d from %s\n", volumeId, shardId, ecNodes[0].info.Id)
+			continue
+		}
+
+		copyErr := operation.WithVolumeServerClient(false, pb.NewServerAddressFromDataNode(rebuilder.info), erb.commandEnv.option.GrpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
+			_, copyErr := volumeServerClient.VolumeEcShardsCopy(context.Background(), &volume_server_pb.VolumeEcShardsCopyRequest{
+				VolumeId:       uint32(volumeId),
+				Collection:     collection,
+				ShardIds:       []uint32{uint32(shardId)},
+				CopyEcxFile:    needEcxFile,
+				CopyEcjFile:    true,
+				CopyVifFile:    needEcxFile,
+				SourceDataNode: string(pb.NewServerAddressFromDataNode(ecNodes[0].info)),
+			})
+			return copyErr
+		})
 		if copyErr != nil {
 			erb.write("%s failed to copy %d.%d from %s: %v\n", rebuilder.info.Id, volumeId, shardId, ecNodes[0].info.Id, copyErr)
-		} else {
-			erb.write("%s copied %d.%d from %s\n", rebuilder.info.Id, volumeId, shardId, ecNodes[0].info.Id)
-			copiedShardIds = append(copiedShardIds, shardId)
+			continue
 		}
-
+		recoverableRemoteShards++
+		if needEcxFile {
+			needEcxFile = false
+		}
+		erb.write("%s copied %d.%d from %s\n", rebuilder.info.Id, volumeId, shardId, ecNodes[0].info.Id)
+		// Only shards this run actually copied are temp working files to be
+		// deleted afterward; never a pre-existing local or remote shard.
+		copiedShardIds = append(copiedShardIds, shardId)
 	}
 
-	if len(copiedShardIds)+len(localShardIds) >= erasure_coding.DataShardsCount {
+	if len(localShardIds)+recoverableRemoteShards >= erasure_coding.DataShardsCount {
 		return copiedShardIds, localShardIds, nil
 	}
 
-	return nil, nil, fmt.Errorf("%d shards are not enough to recover volume %d", len(copiedShardIds)+len(localShardIds), volumeId)
+	// Hand back what was copied so the caller deletes these orphaned working
+	// shards: recovery failed, but the temp files are already on the rebuilder.
+	return copiedShardIds, localShardIds, fmt.Errorf("%d shards are not enough to recover volume %d", len(localShardIds)+recoverableRemoteShards, volumeId)
 
 }
 

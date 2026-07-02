@@ -57,6 +57,7 @@ const (
 	ErrNoSuchCORSConfiguration
 	ErrNoSuchLifecycleConfiguration
 	ErrNoSuchKey
+	ErrNoSuchVersion
 	ErrNoSuchUpload
 	ErrInvalidBucketName
 	ErrInvalidBucketState
@@ -145,12 +146,18 @@ const (
 	ErrNoSuchBucketEncryptionConfiguration
 	ErrInvalidStorageClass
 
+	ErrInvalidMetadataDirective
+	ErrInvalidTagDirective
+
 	ErrInvalidAttributeName
 
 	// Object key length errors
 	ErrKeyTooLongError
 
 	ErrNoSuchConfiguration
+
+	// Truncated request body (fewer bytes than Content-Length)
+	ErrIncompleteBody
 )
 
 // Error message constants for checksum validation
@@ -278,6 +285,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Description:    "The specified key does not exist.",
 		HTTPStatusCode: http.StatusNotFound,
 	},
+	ErrNoSuchVersion: {
+		Code:           "NoSuchVersion",
+		Description:    "The specified version does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
 	ErrNoSuchUpload: {
 		Code:           "NoSuchUpload",
 		Description:    "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
@@ -287,6 +299,11 @@ var errorCodeResponse = map[ErrorCode]APIError{
 		Code:           "InternalError",
 		Description:    "We encountered an internal error, please try again.",
 		HTTPStatusCode: http.StatusInternalServerError,
+	},
+	ErrIncompleteBody: {
+		Code:           "IncompleteBody",
+		Description:    "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 
 	ErrInvalidPart: {
@@ -611,6 +628,18 @@ var errorCodeResponse = map[ErrorCode]APIError{
 	ErrInvalidStorageClass: {
 		Code:           "InvalidStorageClass",
 		Description:    "The storage class you specified is not valid",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrInvalidMetadataDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown metadata directive.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+
+	ErrInvalidTagDirective: {
+		Code:           "InvalidArgument",
+		Description:    "Unknown tag directive.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 

@@ -212,6 +212,11 @@ func (gcs *gcsRemoteStorageClient) ReadFile(loc *remote_pb.RemoteStorageLocation
 	return
 }
 
+func (gcs *gcsRemoteStorageClient) ReadFileAsStream(ctx context.Context, loc *remote_pb.RemoteStorageLocation, offset int64, size int64) (reader io.ReadCloser, err error) {
+	key := loc.Path[1:]
+	return gcs.client.Bucket(loc.Bucket).Object(key).NewRangeReader(ctx, offset, size)
+}
+
 func (gcs *gcsRemoteStorageClient) WriteDirectory(loc *remote_pb.RemoteStorageLocation, entry *filer_pb.Entry) (err error) {
 	return nil
 }
@@ -227,6 +232,9 @@ func (gcs *gcsRemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocatio
 	metadata := toMetadata(entry.Extended)
 	wc := gcs.client.Bucket(loc.Bucket).Object(key).NewWriter(context.Background())
 	wc.Metadata = metadata
+	if entry.Attributes != nil && entry.Attributes.Mime != "" {
+		wc.ContentType = entry.Attributes.Mime
+	}
 	if _, err = io.Copy(wc, reader); err != nil {
 		return nil, fmt.Errorf("upload to gcs %s/%s%s: %v", loc.Name, loc.Bucket, loc.Path, err)
 	}
@@ -275,6 +283,9 @@ func (gcs *gcsRemoteStorageClient) UpdateFileMetadata(loc *remote_pb.RemoteStora
 func (gcs *gcsRemoteStorageClient) DeleteFile(loc *remote_pb.RemoteStorageLocation) (err error) {
 	key := loc.Path[1:]
 	if err = gcs.client.Bucket(loc.Bucket).Object(key).Delete(context.Background()); err != nil {
+		if errors.Is(err, storage.ErrObjectNotExist) {
+			return remote_storage.ErrRemoteObjectNotFound
+		}
 		return fmt.Errorf("gcs delete %s%s: %v", loc.Bucket, key, err)
 	}
 	return

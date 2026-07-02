@@ -706,7 +706,7 @@ func buildPolicyFromTaskConfigs() *worker_pb.MaintenancePolicy {
 			TaskConfig: &worker_pb.TaskPolicy_VacuumConfig{
 				VacuumConfig: &worker_pb.VacuumTaskConfig{
 					GarbageThreshold:  float64(vacuumConfig.GarbageThreshold),
-					MinVolumeAgeHours: int32(vacuumConfig.MinVolumeAgeSeconds / 3600), // Convert seconds to hours
+					MinVolumeAgeHours: int32((vacuumConfig.MinVolumeAgeSeconds + 3599) / 3600), // round up so sub-hour values don't become 0
 				},
 			},
 		}
@@ -1086,6 +1086,10 @@ func (cp *ConfigPersistence) loadTaskStateLocked(taskID string) (*maintenance.Ma
 	var taskStateFile worker_pb.TaskStateFile
 	if err := proto.Unmarshal(pbData, &taskStateFile); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal task state protobuf: %w", err)
+	}
+
+	if taskStateFile.Task == nil {
+		return nil, fmt.Errorf("task state file %s contains no task data", taskID)
 	}
 
 	// Convert protobuf to maintenance task

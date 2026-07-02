@@ -187,6 +187,17 @@ func (ms *MasterServer) dirAssignHandler(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			stats.MasterPickForWriteErrorCounter.Inc()
 			lastErr = err
+			// See Assign: shed instead of spinning when growth is already in flight.
+			if shouldGrow && vl.HasGrowRequest() {
+				if ms.Topo.AvailableSpaceFor(option) <= 0 {
+					break // out of space: surface the real error (406 below)
+				}
+				w.Header().Set("Retry-After", "1")
+				writeJsonQuiet(w, r, http.StatusServiceUnavailable, operation.AssignResult{
+					Error: fmt.Sprintf("no writable volumes for %s, volume growth in progress", option.String()),
+				})
+				return
+			}
 			time.Sleep(200 * time.Millisecond)
 			continue
 		} else {
@@ -213,13 +224,13 @@ func (ms *MasterServer) maybeAddJwtAuthorization(w http.ResponseWriter, fileId s
 	}
 	var encodedJwt security.EncodedJwt
 	if isWrite {
-		encodedJwt = security.GenJwtForVolumeServer(ms.guard.SigningKey, ms.guard.ExpiresAfterSec, fileId)
+		encodedJwt = security.GenJwtForVolumeServer(ms.guard.SigningKey(), ms.guard.ExpiresAfterSec(), fileId)
 	} else {
-		encodedJwt = security.GenJwtForVolumeServer(ms.guard.ReadSigningKey, ms.guard.ReadExpiresAfterSec, fileId)
+		encodedJwt = security.GenJwtForVolumeServer(ms.guard.ReadSigningKey(), ms.guard.ReadExpiresAfterSec(), fileId)
 	}
 	if encodedJwt == "" {
 		return
 	}
 
-	w.Header().Set("Authorization", "BEARER "+string(encodedJwt))
+	w.Header().Set("Authorization", security.BearerPrefix+string(encodedJwt))
 }

@@ -26,19 +26,20 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			return
 		}
 
+		// WantMd5 gives mount writes a real filer.ETag (server echoes Content-MD5 back).
 		uploadOption := &operation.UploadOption{
 			Filename:          filename,
 			Cipher:            wfs.option.Cipher,
 			IsInputCompressed: false,
 			MimeType:          "",
 			PairMap:           nil,
+			WantMd5:           true,
 		}
-		genFileUrlFn := func(host, fileId string) string {
-			fileUrl := fmt.Sprintf("http://%s/%s", host, fileId)
-			if wfs.option.VolumeServerAccess == "filerProxy" {
-				fileUrl = fmt.Sprintf("http://%s/?proxyChunkId=%s", wfs.getCurrentFiler(), fileId)
+		if wfs.option.VolumeServerAccess == "filerProxy" {
+			// getCurrentFiler() can change on failover, so read it per attempt.
+			uploadOption.GenUploadUrl = func(host, fileId string) string {
+				return fmt.Sprintf("http://%s/?proxyChunkId=%s", wfs.getCurrentFiler(), fileId)
 			}
-			return fileUrl
 		}
 
 		fileId, uploadResult, err, data := uploader.UploadWithRetry(
@@ -52,7 +53,7 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 				DataCenter:  wfs.option.DataCenter,
 				Path:        assignPath,
 			},
-			uploadOption, genFileUrlFn, reader,
+			uploadOption, reader,
 		)
 
 		if err != nil {

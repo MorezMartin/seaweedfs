@@ -137,6 +137,19 @@ var (
 	}
 )
 
+// accountForUnscopedIdentity gives an identity with no configured account a
+// distinct account id from its name, so account-less identities are not all
+// collapsed into the shared admin account for ownership/ACL checks.
+func accountForUnscopedIdentity(name string) *Account {
+	if name == "" || name == AccountAdmin.Id {
+		return &AccountAdmin
+	}
+	return &Account{
+		Id:          name,
+		DisplayName: name,
+	}
+}
+
 type Credential struct {
 	AccessKey  string
 	SecretKey  string
@@ -267,17 +280,6 @@ func NewIdentityAccessManagementWithStore(option *S3ApiServerOption, filerClient
 		if err := iam.loadS3ApiConfigurationFromFile(startConfigFile); err != nil {
 			glog.Fatalf("fail to load config file %s: %v", startConfigFile, err)
 		}
-
-		// Track identity names from static config to protect them from dynamic updates
-		// Must be done under lock to avoid race conditions
-		iam.m.Lock()
-		iam.useStaticConfig = true
-		iam.staticIdentityNames = make(map[string]bool)
-		for _, identity := range iam.identities {
-			iam.staticIdentityNames[identity.Name] = true
-			identity.IsStatic = true
-		}
-		iam.m.Unlock()
 	}
 
 	// Always try to load/merge config from credential manager (filer/db)
@@ -330,6 +332,30 @@ func NewIdentityAccessManagementWithStore(option *S3ApiServerOption, filerClient
 	}
 
 	return iam
+}
+
+// markStaticIdentities marks the identities declared in a static config file
+// (-config, or -iam.config when it carries inline identities) as immutable, so
+// dynamic filer reloads can't overwrite them. It is additive and scoped to the
+// file's identities: a reload protects newly added ones without un-protecting
+// the existing set or freezing dynamic filer-managed identities. useStaticConfig
+// stays gated on whether any static identity exists, so an advanced-IAM file
+// with no inline identities (OIDC/STS only) keeps the dynamic store live.
+func (iam *IdentityAccessManagement) markStaticIdentities(config *iam_pb.S3ApiConfiguration) {
+	iam.m.Lock()
+	defer iam.m.Unlock()
+	if iam.staticIdentityNames == nil {
+		iam.staticIdentityNames = make(map[string]bool)
+	}
+	for _, ident := range config.Identities {
+		iam.staticIdentityNames[ident.Name] = true
+	}
+	for _, identity := range iam.identities {
+		if iam.staticIdentityNames[identity.Name] {
+			identity.IsStatic = true
+		}
+	}
+	iam.useStaticConfig = len(iam.staticIdentityNames) > 0
 }
 
 func (iam *IdentityAccessManagement) pollIamConfigChanges(interval time.Duration) {
@@ -477,27 +503,51 @@ func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromFile(fileName str
 		glog.Warningf("KMS initialization failed: %v", err)
 	}
 
-	return iam.LoadS3ApiConfigurationFromBytes(content)
-}
-
-func (iam *IdentityAccessManagement) LoadS3ApiConfigurationFromBytes(content []byte) error {
-	s3ApiConfiguration := &iam_pb.S3ApiConfiguration{}
-	if err := filer.ParseS3ConfigurationFromBytes(content, s3ApiConfiguration); err != nil {
-		glog.Warningf("unmarshal error: %v", err)
-		return fmt.Errorf("unmarshal error: %w", err)
-	}
-
-	if err := filer.CheckDuplicateAccessKey(s3ApiConfiguration); err != nil {
+	// fromStaticFile=true: this file is the source of truth for its static
+	// identities, so a reload overwrites them (e.g. a rotated secretKey).
+	config, err := iam.loadS3ApiConfigurationFromBytes(content, true)
+	if err != nil {
 		return err
 	}
-
-	if err := iam.loadS3ApiConfiguration(s3ApiConfiguration); err != nil {
-		return err
-	}
+	// Identities listed in a config file are static (immutable). Mark them on
+	// every load so a reload protects newly added identities too, not just the
+	// set present at startup, and push the updated set into the credential
+	// manager so reloaded identities still show up in listings and survive
+	// later dynamic merges.
+	iam.markStaticIdentities(config)
+	iam.updateCredentialManagerStaticIdentities()
 	return nil
 }
 
+func (iam *IdentityAccessManagement) LoadS3ApiConfigurationFromBytes(content []byte) error {
+	_, err := iam.loadS3ApiConfigurationFromBytes(content, false)
+	return err
+}
+
+func (iam *IdentityAccessManagement) loadS3ApiConfigurationFromBytes(content []byte, fromStaticFile bool) (*iam_pb.S3ApiConfiguration, error) {
+	s3ApiConfiguration := &iam_pb.S3ApiConfiguration{}
+	if err := filer.ParseS3ConfigurationFromBytes(content, s3ApiConfiguration); err != nil {
+		glog.Warningf("unmarshal error: %v", err)
+		return nil, fmt.Errorf("unmarshal error: %w", err)
+	}
+
+	if err := filer.CheckDuplicateAccessKey(s3ApiConfiguration); err != nil {
+		return nil, err
+	}
+
+	if err := iam.loadS3ApiConfigurationWithSource(s3ApiConfiguration, fromStaticFile); err != nil {
+		return nil, err
+	}
+	return s3ApiConfiguration, nil
+}
+
 func (iam *IdentityAccessManagement) loadS3ApiConfiguration(config *iam_pb.S3ApiConfiguration) error {
+	return iam.loadS3ApiConfigurationWithSource(config, false)
+}
+
+// fromStaticFile lets a config-file reload overwrite its static identities;
+// dynamic updates keep them immutable.
+func (iam *IdentityAccessManagement) loadS3ApiConfigurationWithSource(config *iam_pb.S3ApiConfiguration, fromStaticFile bool) error {
 	// Check if we need to merge with existing static configuration
 	iam.m.RLock()
 	hasStaticConfig := iam.useStaticConfig && len(iam.staticIdentityNames) > 0
@@ -505,7 +555,7 @@ func (iam *IdentityAccessManagement) loadS3ApiConfiguration(config *iam_pb.S3Api
 
 	if hasStaticConfig {
 		// Merge mode: preserve static identities, add/update dynamic ones
-		return iam.MergeS3ApiConfiguration(config)
+		return iam.MergeS3ApiConfiguration(config, fromStaticFile)
 	}
 
 	// Normal mode: completely replace configuration
@@ -585,7 +635,18 @@ func (iam *IdentityAccessManagement) ReplaceS3ApiConfiguration(config *iam_pb.S3
 			t.Account = &AccountAnonymous
 			identityAnonymous = t
 		case ident.Account == nil:
-			t.Account = &AccountAdmin
+			// Account-less identities own resources under a distinct id derived
+			// from their name. Reuse an explicitly-configured account with that
+			// id if one exists (preserving its display name/email); otherwise
+			// synthesize one and register it so the id resolves via
+			// GetAccountNameById (ACL grantee validation, owner display).
+			synthesized := accountForUnscopedIdentity(t.Name)
+			if existing, ok := accounts[synthesized.Id]; ok {
+				t.Account = existing
+			} else {
+				t.Account = synthesized
+				accounts[synthesized.Id] = synthesized
+			}
 		default:
 			if account, ok := accounts[ident.Account.Id]; ok {
 				t.Account = account
@@ -713,10 +774,9 @@ func (iam *IdentityAccessManagement) ReplaceS3ApiConfiguration(config *iam_pb.S3
 	return nil
 }
 
-// MergeS3ApiConfiguration merges dynamic configuration with existing static configuration
-// Static identities (from file) are preserved and cannot be updated
-// Dynamic identities (from filer/admin) can be added or updated
-func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3ApiConfiguration) error {
+// MergeS3ApiConfiguration adds/updates dynamic identities while preserving static
+// ones. A config-file reload (fromStaticFile) may also overwrite its static identities.
+func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3ApiConfiguration, fromStaticFile bool) error {
 	// Start with current configuration (which includes static identities)
 	iam.m.RLock()
 	identities := make([]*Identity, len(iam.identities))
@@ -781,15 +841,14 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 		emailAccount[AccountAnonymous.EmailAddress] = accounts[AccountAnonymous.Id]
 	}
 
-	// Process identities from dynamic config
 	for _, ident := range config.Identities {
-		// Skip static identities - they cannot be updated
-		if staticNames[ident.Name] {
+		// Static identities are immutable to dynamic updates, but the config file can update them.
+		if !fromStaticFile && staticNames[ident.Name] {
 			glog.V(3).Infof("skipping static identity %s (immutable)", ident.Name)
 			continue
 		}
 
-		glog.V(3).Infof("loading/updating dynamic identity %s (disabled=%v)", ident.Name, ident.Disabled)
+		glog.V(3).Infof("loading/updating identity %s (disabled=%v)", ident.Name, ident.Disabled)
 		t := &Identity{
 			Name:         ident.Name,
 			Credentials:  nil,
@@ -797,6 +856,9 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 			PrincipalArn: generatePrincipalArn(ident.Name),
 			Disabled:     ident.Disabled,
 			PolicyNames:  ident.PolicyNames,
+			// File identities are static; set it here so the published identity is
+			// never briefly observable as non-static (RemoveIdentity guards on it).
+			IsStatic: fromStaticFile,
 		}
 
 		switch {
@@ -804,7 +866,18 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 			t.Account = &AccountAnonymous
 			identityAnonymous = t
 		case ident.Account == nil:
-			t.Account = &AccountAdmin
+			// Account-less identities own resources under a distinct id derived
+			// from their name. Reuse an explicitly-configured account with that
+			// id if one exists (preserving its display name/email); otherwise
+			// synthesize one and register it so the id resolves via
+			// GetAccountNameById (ACL grantee validation, owner display).
+			synthesized := accountForUnscopedIdentity(t.Name)
+			if existing, ok := accounts[synthesized.Id]; ok {
+				t.Account = existing
+			} else {
+				t.Account = synthesized
+				accounts[synthesized.Id] = synthesized
+			}
 		default:
 			if account, ok := accounts[ident.Account.Id]; ok {
 				t.Account = account
@@ -872,8 +945,8 @@ func (iam *IdentityAccessManagement) MergeS3ApiConfiguration(config *iam_pb.S3Ap
 			continue
 		}
 
-		// Skip if parent is a static identity (we don't modify static identities)
-		if staticNames[sa.ParentUser] {
+		// Same static-parent rule as identities above.
+		if !fromStaticFile && staticNames[sa.ParentUser] {
 			glog.V(3).Infof("Skipping service account %s for static parent %s", sa.Id, sa.ParentUser)
 			continue
 		}
@@ -1042,7 +1115,7 @@ func (iam *IdentityAccessManagement) UpsertIdentity(ident *iam_pb.Identity) erro
 	glog.V(1).Infof("IAM: upsert identity %s", ident.Name)
 	return iam.MergeS3ApiConfiguration(&iam_pb.S3ApiConfiguration{
 		Identities: []*iam_pb.Identity{ident},
-	})
+	}, false)
 }
 
 // isEnabled reports whether S3 auth should be enforced for this server.
@@ -1388,9 +1461,30 @@ func (iam *IdentityAccessManagement) authenticateRequestInternal(r *http.Request
 		identity, s3Err = iam.reqSignatureV4Verify(r)
 		amzAuthType = "SigV4"
 	case authTypeStreamingUnsigned:
-		glog.V(4).Infof("unsigned streaming upload")
-		identity, s3Err = iam.reqSignatureV4Verify(r)
-		amzAuthType = "SigV4"
+		// STREAMING-UNSIGNED-PAYLOAD-TRAILER only describes the body encoding; the
+		// request may still be SigV4-signed (header/presigned), JWT-bearer, or fully
+		// anonymous. Modern botocore adds a CRC32 trailer to plain PUTs, so an
+		// anonymous upload also lands here. Dispatch on whatever credential is present.
+		switch {
+		case isRequestSignatureV4(r) || isRequestPresignedSignatureV4(r):
+			glog.V(4).Infof("unsigned streaming upload, signed request")
+			identity, s3Err = iam.reqSignatureV4Verify(r)
+			amzAuthType = "SigV4"
+		case isRequestJWT(r):
+			glog.V(4).Infof("unsigned streaming upload, jwt request")
+			if iam.iamIntegration == nil {
+				return identity, s3err.ErrNotImplemented, reqAuthType
+			}
+			identity, s3Err = iam.authenticateJWTWithIAM(r)
+			amzAuthType = "Jwt"
+		default:
+			glog.V(4).Infof("unsigned streaming upload, anonymous request")
+			amzAuthType = "Anonymous"
+			if identity, found = iam.LookupAnonymous(); !found {
+				r.Header.Set(s3_constants.AmzAuthType, amzAuthType)
+				return identity, s3err.ErrAccessDenied, reqAuthType
+			}
+		}
 	case authTypeJWT:
 		glog.V(4).Infof("jwt auth type detected, iamIntegration != nil? %t", iam.iamIntegration != nil)
 		r.Header.Set(s3_constants.AmzAuthType, "Jwt")
@@ -1438,6 +1532,15 @@ func (iam *IdentityAccessManagement) authRequestWithAuthType(r *http.Request, ac
 		object = prefix
 	}
 
+	// Batch DeleteObjects keys arrive in the body, not the URL: a bucket-level check
+	// here can't match object-scoped policies. DeleteMultipleObjectsHandler authorizes
+	// each key via AuthorizeBatchDeleteKey.
+	if action == s3_constants.ACTION_WRITE && r.Method == http.MethodPost &&
+		object == "" && r.URL.Query().Has("delete") {
+		r.Header.Set(s3_constants.AmzAccountId, identity.Account.Id)
+		return identity, s3err.ErrNone, reqAuthType
+	}
+
 	// For ListBuckets, authorization is performed in the handler by iterating
 	// through buckets and checking permissions for each. Skip the global check here.
 	policyAllows := false
@@ -1466,7 +1569,14 @@ func (iam *IdentityAccessManagement) authRequestWithAuthType(r *http.Request, ac
 			if identity != nil {
 				claims = identity.Claims
 			}
-			allowed, evaluated, err := iam.policyEngine.EvaluatePolicy(bucket, object, string(action), principal, r, claims, nil)
+			// List is bucket-level; the prefix promoted into object (for the
+			// legacy CanDo path) must not scope the resource ARN. Prefix is
+			// matched via the s3:prefix Condition.
+			policyObject := object
+			if action == s3_constants.ACTION_LIST {
+				policyObject = ""
+			}
+			allowed, evaluated, err := iam.policyEngine.EvaluatePolicy(bucket, policyObject, string(action), principal, r, claims, nil)
 
 			if err != nil {
 				// SECURITY: Fail-close on policy evaluation errors
@@ -2144,9 +2254,16 @@ func (iam *IdentityAccessManagement) evaluateIAMPolicies(r *http.Request, identi
 		return false
 	}
 
-	resource := buildResourceARN(bucket, object)
+	// List is bucket-level; the prefix promoted into object (for the legacy
+	// CanDo path) must not scope the resource ARN or the resolved action
+	// (e.g. ListBucketVersions on ?versions). Prefix is matched via s3:prefix.
+	resourceObject := object
+	if action == s3_constants.ACTION_LIST {
+		resourceObject = ""
+	}
+	resource := buildResourceARN(bucket, resourceObject)
 	principal := buildPrincipalARN(identity, r)
-	s3Action := ResolveS3Action(r, string(action), bucket, object)
+	s3Action := ResolveS3Action(r, string(action), bucket, resourceObject)
 	explicitAllow := false
 	conditions := policy_engine.ExtractConditionValuesFromRequest(r)
 	for k, v := range policy_engine.ExtractPrincipalVariables(principal) {
@@ -2186,6 +2303,57 @@ func (iam *IdentityAccessManagement) evaluateIAMPolicies(r *http.Request, identi
 	}
 
 	return explicitAllow
+}
+
+// isActionExplicitlyDeniedByIAM reports whether the identity's attached IAM
+// policies (or its groups') explicitly deny action on resource, evaluated by the
+// advanced IAM manager — the same engine authorizeWithIAM uses, and where both
+// static-config and runtime policies are kept in sync. Unlike VerifyActionPermission
+// it does not require an allow, so it enforces AWS deny-always-wins where the allow
+// comes from elsewhere (e.g. a role trust policy). Fails closed on evaluation error.
+func (iam *IdentityAccessManagement) isActionExplicitlyDeniedByIAM(r *http.Request, identity *Identity, principal, action, resource string) bool {
+	if identity == nil || iam.iamIntegration == nil {
+		return false
+	}
+	provider, ok := iam.iamIntegration.(IAMManagerProvider)
+	if !ok {
+		return false
+	}
+
+	policyNames := make([]string, len(identity.PolicyNames))
+	copy(policyNames, identity.PolicyNames)
+	iam.m.RLock()
+	for _, gn := range iam.userGroups[identity.Name] {
+		if g, exists := iam.groups[gn]; exists && !g.Disabled {
+			policyNames = append(policyNames, g.PolicyNames...)
+		}
+	}
+	iam.m.RUnlock()
+
+	// A chained caller authenticates with an STS session token whose inline
+	// session policy can also carry an explicit deny.
+	sessionToken := r.Header.Get(s3_constants.SeaweedFSSessionTokenHeader)
+	if sessionToken == "" {
+		sessionToken = r.Header.Get("X-Amz-Security-Token")
+		if sessionToken == "" {
+			sessionToken = r.URL.Query().Get("X-Amz-Security-Token")
+		}
+	}
+
+	if len(policyNames) == 0 && sessionToken == "" {
+		return false
+	}
+
+	manager := provider.GetIAMManager()
+	if manager == nil {
+		return false
+	}
+	denied, err := manager.IsPrincipalActionExplicitlyDenied(r.Context(), principal, action, resource, policyNames, sessionToken, extractRequestContext(r))
+	if err != nil {
+		glog.Warningf("AssumeRole explicit-deny check failed for %s, denying: %v", identity.Name, err)
+		return true
+	}
+	return denied
 }
 
 // VerifyActionPermission checks if the identity is allowed to perform the action on the resource.
@@ -2311,6 +2479,73 @@ func (iam *IdentityAccessManagement) AuthorizeCopySource(r *http.Request, identi
 	}
 
 	return iam.VerifyActionPermission(srcReq, identity, Action(action), srcBucket, srcObject)
+}
+
+// AuthorizeBatchDeleteKey authorizes one key from a DeleteObjects body. The route
+// Auth middleware only authenticated the caller (keys arrive in the body, not the
+// URL), so each key is checked here against a synthetic DELETE /<bucket>/<key> that
+// makes ResolveS3Action and buildResourceARN target the object. Mirrors AuthorizeCopySource.
+func (iam *IdentityAccessManagement) AuthorizeBatchDeleteKey(r *http.Request, identity *Identity, bucket, objectKey, versionId string) s3err.ErrorCode {
+	if !iam.isEnabled() {
+		return s3err.ErrNone
+	}
+	if bucket == "" || objectKey == "" {
+		return s3err.ErrNone
+	}
+	if identity == nil {
+		return s3err.ErrAccessDenied
+	}
+	if identity.isAdmin() {
+		return s3err.ErrNone
+	}
+
+	// Shallow copy: authorization only reads headers, and this runs once per key.
+	keyReq := new(http.Request)
+	*keyReq = *r
+	keyURL := &url.URL{
+		Scheme: r.URL.Scheme,
+		Host:   r.URL.Host,
+		Path:   "/" + bucket + "/" + objectKey,
+	}
+	// Build the query from scratch so the envelope's "delete" param can't steer
+	// ResolveS3Action; keep the STS token and per-key versionId for policy eval.
+	keyQuery := make(url.Values)
+	if versionId != "" {
+		keyQuery.Set("versionId", versionId)
+	}
+	if strings.Contains(r.URL.RawQuery, "X-Amz-Security-Token") {
+		if token := r.URL.Query().Get("X-Amz-Security-Token"); token != "" {
+			keyQuery.Set("X-Amz-Security-Token", token)
+		}
+	}
+	if len(keyQuery) > 0 {
+		keyURL.RawQuery = keyQuery.Encode()
+	}
+	keyReq.URL = keyURL
+	keyReq.Method = http.MethodDelete
+	keyReq.RequestURI = ""
+	keyReq.Body = nil
+	keyReq.GetBody = nil
+	keyReq.ContentLength = 0
+
+	action := s3_constants.ACTION_WRITE
+
+	if iam.policyEngine != nil {
+		principal := buildPrincipalARN(identity, keyReq)
+		allowed, evaluated, err := iam.policyEngine.EvaluatePolicy(bucket, objectKey, action, principal, keyReq, identity.Claims, nil)
+		if err != nil {
+			glog.Errorf("DeleteObjects key policy evaluation failed for %s/%s: %v - denying", bucket, objectKey, err)
+			return s3err.ErrAccessDenied
+		}
+		if evaluated {
+			if allowed {
+				return s3err.ErrNone
+			}
+			return s3err.ErrAccessDenied
+		}
+	}
+
+	return iam.VerifyActionPermission(keyReq, identity, Action(action), bucket, objectKey)
 }
 
 // authorizeWithIAM authorizes requests using the IAM integration policy engine

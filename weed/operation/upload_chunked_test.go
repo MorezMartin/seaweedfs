@@ -4,8 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestUploadReaderInChunksReturnsPartialResultsOnError verifies that when
@@ -229,6 +236,61 @@ func TestUploadReaderInChunksContextCancellation(t *testing.T) {
 	}
 }
 
+// TestUploadChunkToHoldersRollsBackOnPartialFailure verifies that when a fan-out
+// chunk write fails on one holder, the copies that already landed on the other
+// holders are deleted (type=replicate, local-only) so nothing is left orphaned.
+func TestUploadChunkToHoldersRollsBackOnPartialFailure(t *testing.T) {
+	const fid = "3,01abcdef"
+	var goodDeletes, badDeletes int32
+
+	// Sequence the failure strictly after the good upload so the test does not
+	// depend on timing: the failing holder returns its error only once the good
+	// holder has stored the chunk, so the good copy is always what gets rolled back.
+	goodUploaded := make(chan struct{})
+	var once sync.Once
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			if strings.Contains(r.URL.Path, "01abcdef") && r.URL.Query().Get("type") == "replicate" {
+				atomic.AddInt32(&goodDeletes, 1)
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		fmt.Fprintf(w, `{"name":"f","size":11}`)
+		once.Do(func() { close(goodUploaded) })
+	}))
+	defer good.Close()
+
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			atomic.AddInt32(&badDeletes, 1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case <-goodUploaded:
+		case <-time.After(5 * time.Second):
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, "boom")
+	}))
+	defer bad.Close()
+
+	hosts := []string{strings.TrimPrefix(good.URL, "http://"), strings.TrimPrefix(bad.URL, "http://")}
+	_, err := uploadChunkToHolders(context.Background(), hosts, fid, []byte("hello world"), "", "", &ChunkedUploadOption{})
+
+	if err == nil {
+		t.Fatal("expected error from a partial fan-out")
+	}
+	if got := atomic.LoadInt32(&goodDeletes); got != 1 {
+		t.Errorf("expected the succeeded holder to receive 1 cleanup DELETE, got %d", got)
+	}
+	if got := atomic.LoadInt32(&badDeletes); got != 0 {
+		t.Errorf("expected no cleanup DELETE to the failed holder, got %d", got)
+	}
+}
+
 // mockFailingReader simulates a reader that fails after reading some data
 type mockFailingReader struct {
 	data      []byte
@@ -309,4 +371,47 @@ func TestUploadReaderInChunksReaderFailure(t *testing.T) {
 
 	t.Logf("✓ Got partial result on read failure: chunks=%d, totalSize=%d",
 		len(result.FileChunks), result.TotalSize)
+}
+
+// truncatedReader yields some bytes then reports io.ErrUnexpectedEOF, mimicking a
+// request body cut short by a client abort or reverse-proxy timeout.
+type truncatedReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *truncatedReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+func TestUploadReaderInChunksTagsTruncatedBody(t *testing.T) {
+	reader := &truncatedReader{data: bytes.Repeat([]byte("x"), 10000)}
+
+	assignFunc := func(ctx context.Context, count int, expectedDataSize uint64) (*VolumeAssignRequest, *AssignResult, error) {
+		return nil, &AssignResult{Fid: "test-fid,1234", Url: "http://test-volume:8080", Count: 1}, nil
+	}
+	uploadFunc := func(ctx context.Context, data []byte, option *UploadOption) (*UploadResult, error) {
+		return &UploadResult{Size: uint32(len(data))}, nil
+	}
+
+	_, err := UploadReaderInChunks(context.Background(), reader, &ChunkedUploadOption{
+		ChunkSize:  8 * 1024,
+		Collection: "test",
+		AssignFunc: assignFunc,
+		UploadFunc: uploadFunc,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a truncated body")
+	}
+	if !errors.Is(err, ErrTruncatedBody) {
+		t.Errorf("expected ErrTruncatedBody, got %v", err)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("expected io.ErrUnexpectedEOF to remain in the chain, got %v", err)
+	}
 }

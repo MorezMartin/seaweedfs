@@ -26,6 +26,12 @@ const (
 	ExtendedKeyMetadataVersion = "s3tables.metadataVersion"
 	ExtendedKeyPolicy          = "s3tables.policy"
 	ExtendedKeyTags            = "s3tables.tags"
+	ExtendedKeyEntryType       = "s3tables.entryType"
+
+	// Entry-type marker values for ExtendedKeyEntryType. Absent or "table" means
+	// a table; views are stored like tables but tagged "view".
+	EntryTypeTable = "table"
+	EntryTypeView  = "view"
 
 	// Maximum request body size (10MB)
 	maxRequestBodySize = 10 * 1024 * 1024
@@ -34,6 +40,7 @@ const (
 var (
 	ErrVersionTokenMismatch = errors.New("version token mismatch")
 	ErrAccessDenied         = errors.New("access denied")
+	ErrTableAlreadyExists   = errors.New("table already exists")
 )
 
 type ResourceType string
@@ -48,6 +55,7 @@ type S3TablesHandler struct {
 	region        string
 	accountID     string
 	defaultAllow  bool // Whether to allow access by default (for zero-config IAM)
+	trusted       bool // Trusted local tooling (shell/admin) bypasses authorization
 	iamAuthorizer IAMAuthorizer
 }
 
@@ -77,6 +85,12 @@ func (h *S3TablesHandler) SetAccountID(accountID string) {
 // SetDefaultAllow sets whether to allow access by default
 func (h *S3TablesHandler) SetDefaultAllow(allow bool) {
 	h.defaultAllow = allow
+}
+
+// SetTrusted lets local tooling that talks to the filer directly (shell, admin
+// console) bypass authorization. HTTP-facing callers must not set it.
+func (h *S3TablesHandler) SetTrusted(trusted bool) {
+	h.trusted = trusted
 }
 
 // FilerClient interface for filer operations
@@ -125,6 +139,8 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 		err = h.handleCreateNamespace(w, r, filerClient)
 	case "GetNamespace":
 		err = h.handleGetNamespace(w, r, filerClient)
+	case "UpdateNamespace":
+		err = h.handleUpdateNamespace(w, r, filerClient)
 	case "ListNamespaces":
 		err = h.handleListNamespaces(w, r, filerClient)
 	case "DeleteNamespace":
@@ -133,6 +149,8 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 	// Table operations
 	case "CreateTable":
 		err = h.handleCreateTable(w, r, filerClient)
+	case "RegisterTable":
+		err = h.handleRegisterTable(w, r, filerClient)
 	case "GetTable":
 		err = h.handleGetTable(w, r, filerClient)
 	case "ListTables":
@@ -141,6 +159,20 @@ func (h *S3TablesHandler) HandleRequest(w http.ResponseWriter, r *http.Request, 
 		err = h.handleUpdateTable(w, r, filerClient)
 	case "DeleteTable":
 		err = h.handleDeleteTable(w, r, filerClient)
+	case "RenameTable":
+		err = h.handleRenameTable(w, r, filerClient)
+
+	// View operations
+	case "CreateView":
+		err = h.handleCreateView(w, r, filerClient)
+	case "GetView":
+		err = h.handleGetView(w, r, filerClient)
+	case "ListViews":
+		err = h.handleListViews(w, r, filerClient)
+	case "UpdateView":
+		err = h.handleUpdateView(w, r, filerClient)
+	case "DeleteView":
+		err = h.handleDeleteView(w, r, filerClient)
 
 	// Table Policy operations
 	case "PutTablePolicy":
@@ -212,7 +244,11 @@ func (h *S3TablesHandler) getAccountID(r *http.Request) string {
 					idField := accountVal.FieldByName("Id")
 					if idField.IsValid() && idField.Kind() == reflect.String {
 						if principal := normalizePrincipalID(idField.String()); principal != "" {
-							return principal
+							// Account-less identities default to the admin account; only
+							// keep it for real admins, else use the unique identity name.
+							if principal != s3_constants.AccountAdminId || hasAdminAction(getIdentityActions(r)) {
+								return principal
+							}
 						}
 					}
 				}
@@ -346,6 +382,10 @@ func (h *S3TablesHandler) generateTableBucketARN(ownerAccountID, bucketName stri
 
 func (h *S3TablesHandler) generateTableARN(ownerAccountID, bucketName, tableID string) string {
 	return fmt.Sprintf("arn:aws:s3tables:%s:%s:bucket/%s/table/%s", h.region, ownerAccountID, bucketName, tableID)
+}
+
+func (h *S3TablesHandler) generateViewARN(ownerAccountID, bucketName, viewID string) string {
+	return fmt.Sprintf("arn:aws:s3tables:%s:%s:bucket/%s/view/%s", h.region, ownerAccountID, bucketName, viewID)
 }
 
 func isAuthError(err error) bool {

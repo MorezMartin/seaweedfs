@@ -72,7 +72,7 @@ jobs:
             cross: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
 
@@ -97,7 +97,7 @@ jobs:
           echo "CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -141,7 +141,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
       - name: Free Disk Space
@@ -207,7 +207,7 @@ jobs:
             org.opencontainers.image.vendor=Chris Lu
       - name: Set up QEMU
         if: matrix.platform != 'amd64'
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@v4.1.0
       - name: Create BuildKit config
         run: |
           cat > /tmp/buildkitd.toml <<EOF
@@ -282,7 +282,7 @@ jobs:
           password: ${{ secrets.GHCR_TOKEN }}
       - name: Checkout for local scan build
         if: needs.setup.outputs.publish != 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
       - name: Download pre-built Rust binaries for local scan
@@ -408,7 +408,7 @@ jobs:
         variant: ${{ fromJSON(needs.setup.outputs.variants) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source_ref || github.ref }}
       

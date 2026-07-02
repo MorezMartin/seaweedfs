@@ -44,6 +44,7 @@ type AdminOptions struct {
 	grpcPort         *int
 	master           *string
 	masters          *string // deprecated, for backward compatibility
+	filerGroup       *string
 	adminUser        *string
 	adminPassword    *string
 	readOnlyUser     *string
@@ -65,7 +66,8 @@ func init() {
 	a.grpcPort = cmdAdmin.Flag.Int("port.grpc", 0, "gRPC server port for worker connections (default: http port + 10000)")
 	a.master = cmdAdmin.Flag.String("master", "localhost:9333", "comma-separated master servers")
 	a.masters = cmdAdmin.Flag.String("masters", "", "comma-separated master servers (deprecated, use -master instead)")
-	a.dataDir = cmdAdmin.Flag.String("dataDir", "", "directory to store admin configuration and data files")
+	a.filerGroup = cmdAdmin.Flag.String("filerGroup", "", "filerGroup for the filers, brokers, and S3 servers")
+	a.dataDir = cmdAdmin.Flag.String("dataDir", ".", "directory to store admin configuration and data files (default current dir; required for maintenance task state to persist)")
 
 	a.adminUser = cmdAdmin.Flag.String("adminUser", "admin", "admin interface username")
 	a.adminPassword = cmdAdmin.Flag.String("adminPassword", "", "admin interface password (if empty, auth is disabled)")
@@ -82,7 +84,7 @@ func init() {
 }
 
 var cmdAdmin = &Command{
-	UsageLine: "admin -port=23646 -master=localhost:9333 [-port.grpc=33646] [-dataDir=/path/to/data]",
+	UsageLine: "admin -port=23646 -master=localhost:9333 [-filerGroup=group] [-port.grpc=33646] [-dataDir=/path/to/data]",
 	Short:     "start SeaweedFS web admin interface",
 	Long: `Start a web admin interface for SeaweedFS cluster management.
 
@@ -99,6 +101,7 @@ var cmdAdmin = &Command{
 
   Example Usage:
     weed admin -port=23646 -master="master1:9333,master2:9333"
+    weed admin -port=23646 -master="localhost:9333" -filerGroup="tenant-a"
     weed admin -port=23646 -master="localhost:9333" -dataDir="/var/lib/seaweedfs-admin"
     weed admin -port=23646 -port.grpc=33646 -master="localhost:9333" -dataDir="~/seaweedfs-admin"
     weed admin -port=9900 -port.grpc=19900 -master="localhost:9333"
@@ -171,8 +174,17 @@ var cmdAdmin = &Command{
     - Metrics are disabled when -metricsPort is 0 (the default)
     - Example: weed admin -metricsPort=9327 -master="localhost:9333"
 
+  Maintenance Configuration:
+    - An optional admin.toml declares maintenance task settings
+      ([maintenance.vacuum], [maintenance.balance], [maintenance.erasure_coding])
+    - Settings in admin.toml are applied at every startup, overriding values
+      saved from the admin UI, so they can be managed declaratively
+    - Requires -dataDir; values can also be set via WEED_* environment
+      variables, e.g. WEED_MAINTENANCE_VACUUM_GARBAGE_THRESHOLD=0.3
+    - Generate example admin.toml: weed scaffold -config=admin
+
   Configuration File:
-    - The security.toml file is read from ".", "$HOME/.seaweedfs/",
+    - The security.toml and admin.toml files are read from ".", "$HOME/.seaweedfs/",
       "/usr/local/etc/seaweedfs/", or "/etc/seaweedfs/", in that order
     - Generate example security.toml: weed scaffold -config=security
 
@@ -190,6 +202,9 @@ func runAdmin(cmd *Command, args []string) bool {
 
 	// Load security configuration
 	util.LoadSecurityConfiguration()
+
+	// Optional admin.toml with maintenance task settings
+	util.LoadConfiguration("admin", false)
 
 	// Apply security.toml / env var fallbacks for credential flags.
 	// CLI flags take precedence over security.toml / WEED_* env vars.
@@ -248,7 +263,6 @@ func runAdmin(cmd *Command, args []string) bool {
 		fmt.Println("WARNING: Admin interface is running without authentication!")
 		fmt.Println("         Set -adminPassword for production use")
 	}
-
 	fmt.Printf("Starting SeaweedFS Admin Interface on port %d\n", *a.port)
 	fmt.Printf("Worker gRPC server will run on port %d\n", *a.grpcPort)
 	fmt.Printf("Masters: %s\n", *a.master)
@@ -338,6 +352,12 @@ func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, 
 		glog.Infof("Data directory created/verified: %s", dataDir)
 	}
 
+	// Write maintenance task settings from admin.toml into the persisted
+	// task configs before the server loads them
+	if err := dash.NewConfigPersistence(dataDir).ApplyMaintenanceConfigFromToml(util.GetViper()); err != nil {
+		return fmt.Errorf("apply admin.toml: %w", err)
+	}
+
 	// Detect TLS configuration to set Secure cookie flag
 	cookieSecure := viper.GetString("https.admin.key") != ""
 
@@ -361,18 +381,12 @@ func startAdminServer(ctx context.Context, options AdminOptions, enableUI bool, 
 		SameSite: http.SameSiteLaxMode,
 	}
 
-	// Static files - serve from embedded filesystem
-	staticFS, err := admin.GetStaticFS()
-	if err != nil {
-		log.Printf("Warning: Failed to load embedded static files: %v", err)
-	} else {
-		staticHandler := http.FileServer(http.FS(staticFS))
-		r.Handle("/static", http.RedirectHandler("/static/", http.StatusMovedPermanently))
-		r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", staticHandler))
-	}
+	// Static files - pre-gzipped and embedded in the binary
+	r.Handle("/static", http.RedirectHandler("/static/", http.StatusMovedPermanently))
+	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", admin.StaticHandler()))
 
 	// Create admin server (plugin is always enabled)
-	adminServer := dash.NewAdminServer(*options.master, nil, dataDir, icebergPort)
+	adminServer := dash.NewAdminServer(*options.master, *options.filerGroup, nil, dataDir, icebergPort)
 
 	// Show discovered filers
 	filers := adminServer.GetAllFilers()
@@ -554,7 +568,8 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		if status >= 200 && status < 300 {
+		// Only log errors; 2xx/3xx (including 304 Not Modified cache hits) are normal.
+		if status < 400 {
 			return
 		}
 

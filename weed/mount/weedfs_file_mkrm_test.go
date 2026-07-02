@@ -307,8 +307,10 @@ func TestAccessChecksPermissions(t *testing.T) {
 	lookupSupplementaryGroupIDs = func(uint32) ([]string, error) {
 		return nil, nil
 	}
+	clearSupplementaryGroupCache()
 	t.Cleanup(func() {
 		lookupSupplementaryGroupIDs = oldLookupSupplementaryGroupIDs
+		clearSupplementaryGroupCache()
 	})
 
 	fullPath := util.FullPath("/visible.txt")
@@ -380,12 +382,68 @@ func TestHasAccessUsesSupplementaryGroups(t *testing.T) {
 	lookupSupplementaryGroupIDs = func(uint32) ([]string, error) {
 		return []string{"456"}, nil
 	}
+	clearSupplementaryGroupCache()
 	t.Cleanup(func() {
 		lookupSupplementaryGroupIDs = oldLookupSupplementaryGroupIDs
+		clearSupplementaryGroupCache()
 	})
 
 	if got := hasAccess(999, 999, 123, 456, 0o060, fuse.R_OK|fuse.W_OK); !got {
 		t.Fatal("supplementary group membership should grant matching group permissions")
+	}
+}
+
+func TestSupplementaryGroupCaching(t *testing.T) {
+	callCount := 0
+	oldLookupSupplementaryGroupIDs := lookupSupplementaryGroupIDs
+	lookupSupplementaryGroupIDs = func(uid uint32) ([]string, error) {
+		callCount++
+		return []string{"456"}, nil
+	}
+	clearSupplementaryGroupCache()
+	t.Cleanup(func() {
+		lookupSupplementaryGroupIDs = oldLookupSupplementaryGroupIDs
+		clearSupplementaryGroupCache()
+	})
+
+	cachedLookupSupplementaryGroupIDs(999)
+	cachedLookupSupplementaryGroupIDs(999)
+	cachedLookupSupplementaryGroupIDs(999)
+
+	if callCount != 1 {
+		t.Fatalf("lookupSupplementaryGroupIDs called %d times, expected 1 (cache should prevent repeated calls)", callCount)
+	}
+
+	cachedLookupSupplementaryGroupIDs(1000)
+	if callCount != 2 {
+		t.Fatalf("lookupSupplementaryGroupIDs called %d times after different UID, expected 2", callCount)
+	}
+}
+
+func TestSupplementaryGroupCacheExpiry(t *testing.T) {
+	callCount := 0
+	oldLookupSupplementaryGroupIDs := lookupSupplementaryGroupIDs
+	oldTTL := supplementaryGroupCacheTTL
+	supplementaryGroupCacheTTL = 0
+	lookupSupplementaryGroupIDs = func(uid uint32) ([]string, error) {
+		callCount++
+		return []string{"456"}, nil
+	}
+	clearSupplementaryGroupCache()
+	t.Cleanup(func() {
+		lookupSupplementaryGroupIDs = oldLookupSupplementaryGroupIDs
+		supplementaryGroupCacheTTL = oldTTL
+		clearSupplementaryGroupCache()
+	})
+
+	cachedLookupSupplementaryGroupIDs(999)
+	if callCount != 1 {
+		t.Fatalf("Expected 1 lookup on first call, got %d", callCount)
+	}
+
+	cachedLookupSupplementaryGroupIDs(999)
+	if callCount != 2 {
+		t.Fatalf("Expected 2 lookups after TTL expiry, got %d", callCount)
 	}
 }
 
@@ -427,5 +485,71 @@ func TestCreateExistingFileIgnoresQuotaPreflight(t *testing.T) {
 	}, "existing.txt", out)
 	if status != fuse.Status(syscall.EEXIST) {
 		t.Fatalf("Create status = %v, want EEXIST", status)
+	}
+}
+
+// With default_permissions the kernel enforces unix bits before it calls
+// Open, so AcquireHandle must skip its own check (and the group lookup behind
+// it). Without it, AcquireHandle stays the enforcer.
+func TestAcquireHandleHonorsDefaultPermissions(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		defaultPermissions bool
+		want               fuse.Status
+	}{
+		{"kernel enforces", true, fuse.OK},
+		{"mount enforces", false, fuse.EACCES},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wfs, _ := newCreateTestWFS(t)
+			wfs.option.DefaultPermissions = tc.defaultPermissions
+
+			oldLookup := lookupSupplementaryGroupIDs
+			lookupSupplementaryGroupIDs = func(uint32) ([]string, error) { return nil, nil }
+			clearSupplementaryGroupCache()
+			t.Cleanup(func() {
+				lookupSupplementaryGroupIDs = oldLookup
+				clearSupplementaryGroupCache()
+			})
+
+			entry := &filer_pb.Entry{
+				Name: "secret.txt",
+				Attributes: &filer_pb.FuseAttributes{
+					FileMode: 0o600, // owner-only: an "other" uid has no read
+					Inode:    202,
+					Crtime:   1,
+					Mtime:    1,
+					Uid:      123,
+					Gid:      456,
+				},
+			}
+			if err := wfs.metaCache.InsertEntry(context.Background(), filer.FromPbEntry("/", entry)); err != nil {
+				t.Fatalf("InsertEntry: %v", err)
+			}
+			inode := wfs.inodeToPath.Lookup(util.FullPath("/secret.txt"), entry.Attributes.Crtime, false, false, entry.Attributes.Inode, true)
+
+			fh, status := wfs.AcquireHandle(inode, syscall.O_RDONLY, 999, 999)
+			if status != tc.want {
+				t.Fatalf("AcquireHandle status = %v, want %v", status, tc.want)
+			}
+			if status == fuse.OK {
+				if fh == nil {
+					t.Fatal("AcquireHandle returned nil handle on OK")
+				}
+				wfs.ReleaseHandle(fh.fh)
+			}
+		})
+	}
+}
+
+// default_permissions skips only the mode-bit check, not parent-existence
+// validation: the create RPC sets SkipCheckParentDirectory, so the mount's
+// own parent lookup is the only thing guarding against an orphaned entry.
+func TestCreateRegularFileValidatesParentUnderDefaultPermissions(t *testing.T) {
+	wfs, _ := newCreateTestWFS(t)
+	wfs.option.DefaultPermissions = true
+
+	if _, _, code := wfs.createRegularFile(util.FullPath("/ghost"), "f.txt", 0o644, 99, 100, 0, false, false); code == fuse.OK {
+		t.Fatal("createRegularFile returned OK for a missing parent directory")
 	}
 }

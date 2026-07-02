@@ -4,9 +4,10 @@
 //! matching Go's `server/volume_grpc_client_to_master.go`.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
@@ -314,6 +315,7 @@ fn collect_ec_shard_delta_messages(
                         disk_type: ec_vol.disk_type.to_string(),
                         expire_at_sec: ec_vol.expire_at_sec,
                         disk_id: disk_id as u32,
+                        encode_ts_ns: ec_vol.encode_ts_ns,
                         ..Default::default()
                     },
                 );
@@ -623,7 +625,8 @@ async fn send_deregister_heartbeat(
 ) {
     let empty = {
         let store = state.store.read().unwrap();
-        let (location_uuids, disk_tags) = collect_location_metadata(&store);
+        // Deregister: no effective max computed, fall back to configured max.
+        let (location_uuids, disk_tags) = collect_location_metadata(&store, &[]);
         master_pb::Heartbeat {
             id: store.id.clone(),
             ip: config.ip.clone(),
@@ -745,7 +748,10 @@ fn collect_heartbeat(
     )
 }
 
-fn collect_location_metadata(store: &Store) -> (Vec<String>, Vec<master_pb::DiskTag>) {
+fn collect_location_metadata(
+    store: &Store,
+    disk_max_by_id: &[i32],
+) -> (Vec<String>, Vec<master_pb::DiskTag>) {
     let location_uuids = store
         .locations
         .iter()
@@ -755,9 +761,17 @@ fn collect_location_metadata(store: &Store) -> (Vec<String>, Vec<master_pb::Disk
         .locations
         .iter()
         .enumerate()
-        .map(|(disk_id, loc)| master_pb::DiskTag {
-            disk_id: disk_id as u32,
-            tags: loc.tags.clone(),
+        .map(|(disk_id, loc)| {
+            let max_volume_count = disk_max_by_id
+                .get(disk_id)
+                .copied()
+                .unwrap_or_else(|| loc.max_volume_count.load(Ordering::Relaxed));
+            master_pb::DiskTag {
+                disk_id: disk_id as u32,
+                tags: loc.tags.clone(),
+                r#type: loc.disk_type.to_string(),
+                max_volume_count: max_volume_count as i64,
+            }
         })
         .collect();
     (location_uuids, disk_tags)
@@ -788,12 +802,17 @@ fn build_heartbeat_with_ec_status(
     let mut volumes = Vec::new();
     let mut max_file_key = NeedleId(0);
     let mut max_volume_counts: HashMap<String, u32> = HashMap::new();
+    let mut disk_total_bytes: HashMap<String, u64> = HashMap::new();
+    let mut disk_free_bytes: HashMap<String, u64> = HashMap::new();
 
     // Collect per-collection disk size and read-only counts for metrics
     let mut disk_sizes: HashMap<String, (u64, u64)> = HashMap::new(); // (normal, deleted)
     let mut ro_counts: HashMap<String, ReadOnlyCounts> = HashMap::new();
 
     let volume_size_limit = store.volume_size_limit.load(Ordering::Relaxed);
+
+    // Per-disk effective max for DiskTag, captured alongside the per-type sum.
+    let mut disk_max_by_id = vec![0i32; store.locations.len()];
 
     for (disk_id, loc) in store.locations.iter_mut().enumerate() {
         let disk_type_str = loc.disk_type.to_string();
@@ -810,7 +829,15 @@ fn build_heartbeat_with_ec_status(
         if effective_max_count < 0 {
             effective_max_count = 0;
         }
-        *max_volume_counts.entry(disk_type_str).or_insert(0) += effective_max_count as u32;
+        *max_volume_counts.entry(disk_type_str.clone()).or_insert(0) += effective_max_count as u32;
+        disk_max_by_id[disk_id] = effective_max_count;
+        // Sum capacity per disk type; assumes one location per filesystem. Locations
+        // sharing a mount over-report absolute bytes but not the used ratio the gate
+        // uses. Mirrors weed/storage/store.go.
+        *disk_total_bytes.entry(disk_type_str.clone()).or_insert(0) +=
+            loc.disk_total_bytes.load(Ordering::Relaxed);
+        *disk_free_bytes.entry(disk_type_str).or_insert(0) +=
+            loc.disk_free_bytes.load(Ordering::Relaxed);
 
         let mut delete_vids = Vec::new();
         for (_, vol) in loc.iter_volumes() {
@@ -826,6 +853,27 @@ fn build_heartbeat_with_ec_status(
                 delete_vids.push(vol.id);
                 should_delete_volume = true;
             } else if !vol.is_expired(volume_size, volume_size_limit) {
+                // Detect phantom volumes: the .dat was unlinked from disk but is still
+                // held open as a deleted FD, so the volume keeps serving and heartbeating
+                // while no disk-path operation can ever succeed. Skip remote-tiered volumes,
+                // whose .dat legitimately lives in cloud storage. Only a present .dat is
+                // cached for 30s; a missing one is re-checked every heartbeat so the volume
+                // stays suppressed until the file returns. See issues/10004
+                if vol.file_count() > 0 && !vol.has_remote_file {
+                    const DISK_CHECK_INTERVAL_NS: i64 = 30 * 1_000_000_000;
+                    let now_ns = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or(Duration::ZERO)
+                        .as_nanos() as i64;
+                    if now_ns - vol.last_disk_check_ns.load(Ordering::Relaxed) > DISK_CHECK_INTERVAL_NS {
+                        if !Path::new(&vol.file_name(".dat")).exists() {
+                            warn!("Volume {}: data file {} missing (held open as deleted FD) - not reporting to master", vol.id.0, vol.file_name(".dat"));
+                            continue;
+                        }
+                        vol.last_disk_check_ns.store(now_ns, Ordering::Relaxed);
+                    }
+                }
+
                 let (remote_storage_name, remote_storage_key) = vol.remote_storage_name_key();
                 volumes.push(master_pb::VolumeInformationMessage {
                     id: vol.id.0,
@@ -838,7 +886,7 @@ fn build_heartbeat_with_ec_status(
                     replica_placement: vol.super_block.replica_placement.to_byte() as u32,
                     version: vol.super_block.version.0 as u32,
                     ttl: vol.super_block.ttl.to_u32(),
-                    compact_revision: vol.last_compact_revision() as u32,
+                    compact_revision: vol.super_block.compaction_revision as u32,
                     modified_at_second: vol.last_modified_ts() as i64,
                     disk_type: loc.disk_type.to_string(),
                     disk_id: disk_id as u32,
@@ -907,7 +955,7 @@ fn build_heartbeat_with_ec_status(
     crate::metrics::MAX_VOLUMES.set(total_max);
 
     let has_no_volumes = volumes.is_empty();
-    let (location_uuids, disk_tags) = collect_location_metadata(store);
+    let (location_uuids, disk_tags) = collect_location_metadata(store, &disk_max_by_id);
 
     master_pb::Heartbeat {
         id: store.id.clone(),
@@ -923,6 +971,8 @@ fn build_heartbeat_with_ec_status(
         has_no_volumes,
         has_no_ec_shards,
         max_volume_counts,
+        disk_total_bytes,
+        disk_free_bytes,
         grpc_port: config.grpc_port as u32,
         location_uuids,
         disk_tags,
@@ -1046,6 +1096,7 @@ mod tests {
             write_queue: std::sync::OnceLock::new(),
             s3_tier_registry: std::sync::RwLock::new(S3TierRegistry::new()),
             read_mode: ReadMode::Local,
+            allow_untrusted_remote_endpoints: false,
             master_url: String::new(),
             master_urls: Vec::new(),
             seed_master_set: std::collections::HashSet::new(),
@@ -1129,6 +1180,46 @@ mod tests {
             heartbeat.disk_tags[0].tags,
             vec!["fast".to_string(), "ssd".to_string()]
         );
+        assert_eq!(heartbeat.disk_tags[0].r#type, DiskType::HardDrive.to_string());
+        assert_eq!(heartbeat.disk_tags[0].max_volume_count, 3);
+    }
+
+    #[test]
+    fn test_build_heartbeat_disk_tag_reflects_disk_space_low_override() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+
+        let mut store = Store::new(NeedleMapKind::InMemory);
+        store
+            .add_location(
+                dir,
+                dir,
+                3,
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                vec![],
+            )
+            .unwrap();
+        store
+            .add_volume(
+                VolumeId(7),
+                "pics",
+                None,
+                None,
+                0,
+                DiskType::HardDrive,
+                Version::current(),
+            )
+            .unwrap();
+
+        // Low disk space caps the per-disk max at used slots (1 volume, 0 EC).
+        store.locations[0]
+            .is_disk_space_low
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let heartbeat = build_heartbeat(&test_config(), &mut store);
+        assert_eq!(heartbeat.disk_tags[0].max_volume_count, 1);
+        assert_eq!(heartbeat.max_volume_counts[&DiskType::HardDrive.to_string()], 1);
     }
 
     #[test]
@@ -1235,6 +1326,43 @@ mod tests {
                 .with_label_values(&[collection, DISK_SIZE_LABEL_DELETED_BYTES])
                 .get(),
             0.0
+        );
+    }
+
+    #[test]
+    fn test_build_heartbeat_reports_disk_bytes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+
+        let mut store = Store::new(NeedleMapKind::InMemory);
+        store
+            .add_location(
+                dir,
+                dir,
+                8,
+                DiskType::HardDrive,
+                MinFreeSpace::Percent(1.0),
+                Vec::new(),
+            )
+            .unwrap();
+        // Populate the cached physical-capacity fields from a real statvfs probe.
+        store.locations[0].check_disk_space();
+
+        let heartbeat = build_heartbeat(&test_config(), &mut store);
+        let disk_type = store.locations[0].disk_type.to_string();
+
+        assert!(
+            heartbeat
+                .disk_total_bytes
+                .get(&disk_type)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "expected nonzero disk_total_bytes for the temp filesystem"
+        );
+        assert!(
+            heartbeat.disk_free_bytes.contains_key(&disk_type),
+            "expected a disk_free_bytes entry for the disk type"
         );
     }
 

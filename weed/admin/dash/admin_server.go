@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/admin/maintenance"
@@ -84,10 +85,17 @@ type AdminServer struct {
 	masterClient    *wdclient.MasterClient
 	templateFS      http.FileSystem
 	dataDir         string
+	filerGroup      string
 	grpcDialOption  grpc.DialOption
 	cacheExpiration time.Duration
 	lastCacheUpdate time.Time
 	cachedTopology  *ClusterTopology
+
+	// dashSamples is a bounded in-memory ring of recent cluster snapshots that
+	// powers the dashboard's at-a-glance sparklines (see dashboard_metrics.go),
+	// filled on the maintenance-metrics ticker. No Prometheus dependency.
+	dashSamples   []dashSample
+	dashSamplesMu sync.Mutex
 
 	// Filer discovery and caching
 	cachedFilers         []string
@@ -127,13 +135,13 @@ type AdminServer struct {
 
 // Type definitions moved to types.go
 
-func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, icebergPort int) *AdminServer {
+func NewAdminServer(masters string, filerGroup string, templateFS http.FileSystem, dataDir string, icebergPort int) *AdminServer {
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.admin")
 
 	// Create master client with multiple master support
 	masterClient := wdclient.NewMasterClient(
 		grpcDialOption,
-		"",      // filerGroup - not needed for admin
+		filerGroup,
 		"admin", // clientType
 		"",      // clientHost - not needed for admin
 		"",      // dataCenter - not needed for admin
@@ -155,6 +163,7 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 		masterClient:                  masterClient,
 		templateFS:                    templateFS,
 		dataDir:                       dataDir,
+		filerGroup:                    filerGroup,
 		grpcDialOption:                grpcDialOption,
 		cacheExpiration:               defaultCacheTimeout,
 		filerCacheExpiration:          defaultFilerCacheTimeout,
@@ -286,6 +295,13 @@ func NewAdminServer(masters string, templateFS http.FileSystem, dataDir string, 
 	return server
 }
 
+func (s *AdminServer) listClusterNodesRequest(clientType string) *master_pb.ListClusterNodesRequest {
+	return &master_pb.ListClusterNodesRequest{
+		ClientType: clientType,
+		FilerGroup: s.filerGroup,
+	}
+}
+
 // vacuumToggler abstracts the master's vacuum enable/disable for testing.
 type vacuumToggler interface {
 	disableVacuum() error
@@ -375,12 +391,16 @@ func (s *AdminServer) publishMaintenanceMetrics(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Seed one sample so the dashboard has something to draw before the first tick.
+	s.recordDashboardSample()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.collectMaintenanceMetrics()
+			s.recordDashboardSample()
 		}
 	}
 }
@@ -1101,9 +1121,7 @@ func (s *AdminServer) GetClusterFilers() (*ClusterFilersData, error) {
 
 	// Get filer information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.FilerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.FilerType))
 		if err != nil {
 			return err
 		}
@@ -1148,9 +1166,7 @@ func (s *AdminServer) GetClusterBrokers() (*ClusterBrokersData, error) {
 
 	// Get broker information from master using ListClusterNodes
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.BrokerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.BrokerType))
 		if err != nil {
 			return err
 		}
@@ -1186,6 +1202,50 @@ func (s *AdminServer) GetClusterBrokers() (*ClusterBrokersData, error) {
 		Brokers:      brokers,
 		TotalBrokers: len(brokers),
 		LastUpdated:  time.Now(),
+	}, nil
+}
+
+// GetClusterS3Servers retrieves cluster S3 servers data
+func (s *AdminServer) GetClusterS3Servers() (*ClusterS3ServersData, error) {
+	var s3Servers []S3ServerInfo
+
+	// Get S3 server information from master using ListClusterNodes
+	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.S3Type))
+		if err != nil {
+			return err
+		}
+
+		// Process each S3 server node
+		for _, node := range resp.ClusterNodes {
+			createdAt := time.Unix(0, node.CreatedAtNs)
+
+			s3ServerInfo := S3ServerInfo{
+				Address:    pb.ServerAddress(node.Address).ToHttpAddress(),
+				DataCenter: node.DataCenter,
+				Version:    node.Version,
+				CreatedAt:  createdAt,
+			}
+
+			s3Servers = append(s3Servers, s3ServerInfo)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get S3 server nodes from master: %w", err)
+	}
+
+	// Sort S3 servers by address for consistent ordering on page refresh
+	sort.Slice(s3Servers, func(i, j int) bool {
+		return s3Servers[i].Address < s3Servers[j].Address
+	})
+
+	return &ClusterS3ServersData{
+		S3Servers:      s3Servers,
+		TotalS3Servers: len(s3Servers),
+		LastUpdated:    time.Now(),
 	}, nil
 }
 
@@ -1585,9 +1645,7 @@ func (s *AdminServer) UpdateTopicRetention(namespace, name string, enabled bool,
 	// Get broker information from master
 	var brokerAddress string
 	err := s.WithMasterClient(func(client master_pb.SeaweedClient) error {
-		resp, err := client.ListClusterNodes(context.Background(), &master_pb.ListClusterNodesRequest{
-			ClientType: cluster.BrokerType,
-		})
+		resp, err := client.ListClusterNodes(context.Background(), s.listClusterNodesRequest(cluster.BrokerType))
 		if err != nil {
 			return err
 		}
@@ -1778,7 +1836,7 @@ func collectCollectionStats(topologyInfo *master_pb.TopologyInfo) map[string]col
 						shards := erasure_coding.ShardsInfoFromVolumeEcShardInformationMessage(ecShardInfo)
 						data := collectionMap[collection]
 						data.PhysicalSize += int64(shards.TotalSize())
-						data.LogicalSize += int64(shards.MinusParityShards().TotalSize())
+						data.LogicalSize += int64(shards.MinusParityShards(erasure_coding.DataShardsCount).TotalSize())
 						collectionMap[collection] = data
 
 						// fileCount is volume-wide (same .ecx on every shard

@@ -267,7 +267,7 @@ func (wfs *WFS) updateServerSideWholeFileCopyMetaCache(dstPath util.FullPath, en
 	event := metadataUpdateEvent(dir, entry)
 	if applyErr := wfs.applyLocalMetadataEvent(context.Background(), event); applyErr != nil {
 		glog.Warningf("CopyFileRange metadata update %s: %v", dstPath, applyErr)
-		wfs.markDirectoryReadThrough(util.FullPath(dir))
+		wfs.purgeDirectoryCache(util.FullPath(dir))
 	}
 }
 
@@ -427,7 +427,7 @@ func (wfs *WFS) copyEntryViaFiler(cancel <-chan struct{}, copyRequest wholeFileS
 		return nil, serverSideWholeFileCopyNotCommitted, fmt.Errorf("create filer copy request: %w", err)
 	}
 	if jwt := wfs.filerCopyJWT(); jwt != "" {
-		req.Header.Set("Authorization", "Bearer "+string(jwt))
+		req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
 	}
 
 	resp, err := httpClient.Do(req)
@@ -504,4 +504,3 @@ func (wfs *WFS) filerCopyJWT() security.EncodedJwt {
 	}
 	return security.GenJwtForFilerServer(wfs.option.FilerSigningKey, wfs.option.FilerSigningExpiresAfterSec)
 }
-

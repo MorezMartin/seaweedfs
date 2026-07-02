@@ -371,9 +371,6 @@ func (worker *FileCopyWorker) uploadFileAsOne(task FileCopyTask, f *os.File) err
 				MimeType:          mimeType,
 				PairMap:           nil,
 			},
-			func(host, fileId string) string {
-				return fmt.Sprintf("http://%s/%s", host, fileId)
-			},
 			util.NewBytesReader(data),
 		)
 		if flushErr != nil {
@@ -455,9 +452,6 @@ func (worker *FileCopyWorker) uploadFileInChunks(task FileCopyTask, f *os.File, 
 					IsInputCompressed: false,
 					MimeType:          "",
 					PairMap:           nil,
-				},
-				func(host, fileId string) string {
-					return fmt.Sprintf("http://%s/%s", host, fileId)
 				},
 				io.NewSectionReader(f, i*chunkSize, chunkSize),
 			)
@@ -576,9 +570,6 @@ func (worker *FileCopyWorker) saveDataAsChunk(reader io.Reader, name string, off
 			MimeType:          "",
 			PairMap:           nil,
 		},
-		func(host, fileId string) string {
-			return fmt.Sprintf("http://%s/%s", host, fileId)
-		},
 		reader,
 	)
 
@@ -596,7 +587,7 @@ var _ = filer_pb.FilerClient(&FileCopyWorker{})
 func (worker *FileCopyWorker) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) (err error) {
 
 	filerGrpcAddress := worker.filerAddress.ToGrpcAddress()
-	err = pb.WithGrpcClient(streamingMode, worker.signature, func(grpcConnection *grpc.ClientConn) error {
+	err = pb.WithGrpcClient(context.Background(), streamingMode, worker.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, filerGrpcAddress, false, worker.options.grpcDialOption)
