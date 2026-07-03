@@ -2,17 +2,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  {{- /* Merge tolerate-unready-endpoints + custom annotations + Traefik service-level annotations */}}
-  {{- $svcAnnotations := dict "service.alpha.kubernetes.io/tolerate-unready-endpoints" "true" }}
-  {{- if .Values.filer.annotations }}
-    {{- $_ := mergeOverwrite $svcAnnotations .Values.filer.annotations }}
-  {{- end }}
-  {{- if and (hasPrefix "traefik" (default "" .Values.filer.ingresses.grpc.className)) .Values.global.seaweedfs.enableSecurity }}
-    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serversscheme" "https" }}
-    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serverstransport" (printf "%s-%s-filer-grpc-transport@kubernetescrd" .Release.Namespace (include "seaweedfs.fullname" .)) }}
-  {{- end }}
   annotations:
-    {{- toYaml $svcAnnotations | nindent 4 }}
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+  {{- if .Values.filer.annotations }}
+    {{- toYaml .Values.filer.annotations | nindent 4 }}
+  {{- end }}
   name: {{ include "seaweedfs.componentName" (list . "filer") }}
   namespace: {{ .Release.Namespace }}
   labels:
@@ -28,10 +22,6 @@ spec:
   - name: "swfs-filer"
     port: {{ .Values.filer.port }}
     targetPort: {{ .Values.filer.port }}
-    protocol: TCP
-  - name: "swfs-filer-grpc"
-    port: {{ .Values.filer.grpcPort }}
-    targetPort: {{ .Values.filer.grpcPort }}
     protocol: TCP
   {{- if .Values.filer.s3.enabled }}
   - name: "swfs-s3"

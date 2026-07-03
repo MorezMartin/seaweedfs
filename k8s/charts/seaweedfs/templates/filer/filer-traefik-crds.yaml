@@ -50,10 +50,9 @@ metadata:
     app.kubernetes.io/component: filer
     app.kubernetes.io/part-of: seaweedfs
 spec:
-  {{- /* serverName correspond au nom du service Kubernetes du filer,
+  {{- /* serverName correspond au service gRPC dédié (filer-client),
          couvert par les SAN wildcard (*.namespace.svc) du certificat filer */}}
-  {{- $backendService := ternary "all-in-one" "filer" .Values.allInOne.enabled }}
-  {{- $backendServiceName := include "seaweedfs.componentName" (list . $backendService) }}
+  {{- $backendServiceName := include "seaweedfs.componentName" (list . "filer-client") }}
   serverName: {{ printf "%s.%s.svc" $backendServiceName .Release.Namespace | quote }}
   rootCAs:
     - secret: {{ include "seaweedfs.fullname" . }}-ca-cert

@@ -1,0 +1,42 @@
+{{- /* Dedicated gRPC Service for Traefik mTLS
+       Only the gRPC port is exposed here; the HTTP port stays on the main
+       filer Service.  Traefik annotations are applied exclusively to this
+       Service so they do not affect other ports. */}}
+{{- if and .Values.filer.enabled .Values.filer.ingresses.grpc.enabled }}
+{{- /* Use filer-client component name to avoid conflicts */}}
+apiVersion: v1
+kind: Service
+metadata:
+  {{- /* Merge tolerate-unready-endpoints + custom annotations + Traefik
+         service-level annotations */}}
+  {{- $svcAnnotations := dict "service.alpha.kubernetes.io/tolerate-unready-endpoints" "true" }}
+  {{- if .Values.filer.annotations }}
+    {{- $_ := mergeOverwrite $svcAnnotations .Values.filer.annotations }}
+  {{- end }}
+  {{- if and (hasPrefix "traefik" (default "" .Values.filer.ingresses.grpc.className)) .Values.global.seaweedfs.enableSecurity }}
+    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serversscheme" "https" }}
+    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serverstransport" (printf "%s-%s-filer-grpc-transport@kubernetescrd" .Release.Namespace (include "seaweedfs.fullname" .)) }}
+  {{- end }}
+  annotations:
+    {{- toYaml $svcAnnotations | nindent 4 }}
+  name: {{ include "seaweedfs.componentName" (list . "filer-client") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: filer
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+  - name: "swfs-filer-grpc"
+    port: {{ .Values.filer.grpcPort }}
+    targetPort: {{ .Values.filer.grpcPort }}
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{ template "seaweedfs.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: filer
+{{- end }}

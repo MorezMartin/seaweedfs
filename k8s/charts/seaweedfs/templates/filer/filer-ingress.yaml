@@ -114,11 +114,11 @@ spec:
         backend:
 {{- if semverCompare ">=1.19-0" .Capabilities.KubeVersion.GitVersion }}
           service:
-            name: {{ $serviceName }}
+            name: {{ include "seaweedfs.componentName" (list . "filer-client") }}
             port:
               number: {{ .Values.filer.grpcPort }}
 {{- else }}
-          serviceName: {{ $serviceName }}
+          serviceName: {{ include "seaweedfs.componentName" (list . "filer-client") }}
           servicePort: {{ .Values.filer.grpcPort }}
 {{- end }}
 {{- end }}
