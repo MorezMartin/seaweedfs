@@ -8,7 +8,7 @@ metadata:
     {{- $_ := mergeOverwrite $svcAnnotations .Values.filer.annotations }}
   {{- end }}
   {{- if and (hasPrefix "traefik" (default "" .Values.filer.ingresses.grpc.className)) .Values.global.seaweedfs.enableSecurity }}
-    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serverscheme" "https" }}
+    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serversscheme" "https" }}
     {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serverstransport" (printf "%s-%s-filer-grpc-transport@kubernetescrd" .Release.Namespace (include "seaweedfs.fullname" .)) }}
   {{- end }}
   annotations:
