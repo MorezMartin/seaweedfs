@@ -81,16 +81,12 @@ metadata:
   {{- with .Values.filer.ingresses.grpc.annotations }}
     {{- toYaml . | nindent 4 }}
   {{- end }}
-  {{- /* Traefik scheme annotations: h2c when security is off, https+mTLS when on
+  {{- /* Traefik annotations: router-level only (scheme + transport go on the Service)
          Note: Traefik resolves name@kubernetescrd as <namespace>-<name> for
          CRDs stored in its internal registry. Hence the namespace prefix */}}
   {{- if and (hasPrefix "traefik" (default "" .Values.filer.ingresses.grpc.className)) }}
     {{- if .Values.global.seaweedfs.enableSecurity }}
     traefik.ingress.kubernetes.io/router.tls.options: {{ .Release.Namespace }}-{{ include "seaweedfs.fullname" . }}-filer-grpc-mtls@kubernetescrd
-    traefik.ingress.kubernetes.io/service.serverscheme: https
-    traefik.ingress.kubernetes.io/service.serverstransport: {{ .Release.Namespace }}-{{ include "seaweedfs.fullname" . }}-filer-grpc-transport@kubernetescrd
-    {{- else }}
-    traefik.ingress.kubernetes.io/service.serverscheme: h2c
     {{- end }}
   {{- end }}
   labels:

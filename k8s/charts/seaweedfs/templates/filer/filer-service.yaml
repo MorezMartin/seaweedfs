@@ -2,8 +2,17 @@
 apiVersion: v1
 kind: Service
 metadata:
+  {{- /* Merge tolerate-unready-endpoints + custom annotations + Traefik service-level annotations */}}
+  {{- $svcAnnotations := dict "service.alpha.kubernetes.io/tolerate-unready-endpoints" "true" }}
+  {{- if .Values.filer.annotations }}
+    {{- $_ := mergeOverwrite $svcAnnotations .Values.filer.annotations }}
+  {{- end }}
+  {{- if and (hasPrefix "traefik" (default "" .Values.filer.ingresses.grpc.className)) .Values.global.seaweedfs.enableSecurity }}
+    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serverscheme" "https" }}
+    {{- $_ := set $svcAnnotations "traefik.ingress.kubernetes.io/service.serverstransport" (printf "%s-%s-filer-grpc-transport@kubernetescrd" .Release.Namespace (include "seaweedfs.fullname" .)) }}
+  {{- end }}
   annotations:
-    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+    {{- toYaml $svcAnnotations | nindent 4 }}
   name: {{ include "seaweedfs.componentName" (list . "filer") }}
   namespace: {{ .Release.Namespace }}
   labels:
@@ -12,10 +21,6 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: filer
-{{- if .Values.filer.annotations }}
-  annotations:
-    {{- toYaml .Values.filer.annotations | nindent 4 }}
-{{- end }}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
