@@ -1,4 +1,4 @@
-name: "micro: glibc redirect probe"
+name: "micro: aws-lc-sys bcm.c invocation"
 on:
   push:
     branches: [ repro-arm64-musl-noble ]
@@ -9,14 +9,28 @@ jobs:
   probe:
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
       - name: Install cross gcc
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Probe sscanf/strtol symbol per -std
+      - name: Build ONLY aws-lc-sys with verbose
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CFLAGS_aarch64_unknown_linux_musl: -U_FORTIFY_SOURCE
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
         run: |
-          printf '#include <stdio.h>\n#include <stdlib.h>\nint f(const char*s){int i=0; sscanf(s,"%%d",&i); long l=0; l=strtol(s,0,10); return i+(int)l;}\n' > t.c
-          for std in "" "-std=c99" "-std=c11" "-std=gnu17" "-std=c2x" "-std=gnu2x"; do
-            aarch64-linux-gnu-gcc $std -c t.c -o t.o 2>/dev/null
-            printf "%-12s -> " "${std:-default}"; nm t.o | grep -E "isoc23_sscanf| U sscanf|isoc23_strtol| U strtol" | tr '\n' ' '; echo
-          done
-          echo "--- gcc version:"; aarch64-linux-gnu-gcc --version | head -1
-          echo "--- glibc cross headers:"; dpkg -l libc6-dev-arm64-cross | tail -1
+          cd seaweed-volume
+          # extraire aws-lc-sys seul dans un mini-projet pour éviter le build complet
+          cargo fetch 2>/dev/null || true
+          # find aws-lc-sys source path
+          SYSSRC=$(find ~/.cargo/registry/src -maxdepth 1 -name "aws-lc-sys-0.45.0" | head -1)
+          echo "SYSSRC=$SYSSRC"
+          cd /tmp && cargo new probe-lc --bin >/dev/null 2>&1
+          cd probe-lc
+          echo 'aws-lc-sys = { version = "=0.45.0", features = ["ssl"] }' >> Cargo.toml 2>/dev/null || echo 'aws-lc-sys = "0.45.0"' >> Cargo.toml
+          export CARGO_TARGET_DIR=/tmp/probe-lc/target
+          cargo build -vv --target aarch64-unknown-linux-musl 2>&1 | grep -E "bcm\.c|std=|aws-lc-sys" | head -40
