@@ -1,4 +1,4 @@
-name: "micro: aws-lc-sys bcm.c invocation"
+name: "micro: which .o has isoc23 refs"
 on:
   push:
     branches: [ repro-arm64-musl-noble ]
@@ -9,28 +9,30 @@ jobs:
   probe:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
       - name: Install cross gcc
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: Build ONLY aws-lc-sys with verbose
+      - name: Build aws-lc-sys alone and inspect objects
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           CFLAGS_aarch64_unknown_linux_musl: -U_FORTIFY_SOURCE
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
         run: |
-          cd seaweed-volume
-          # extraire aws-lc-sys seul dans un mini-projet pour éviter le build complet
-          cargo fetch 2>/dev/null || true
-          # find aws-lc-sys source path
-          SYSSRC=$(find ~/.cargo/registry/src -maxdepth 1 -name "aws-lc-sys-0.45.0" | head -1)
-          echo "SYSSRC=$SYSSRC"
           cd /tmp && cargo new probe-lc --bin >/dev/null 2>&1
           cd probe-lc
-          echo 'aws-lc-sys = { version = "=0.45.0", features = ["ssl"] }' >> Cargo.toml 2>/dev/null || echo 'aws-lc-sys = "0.45.0"' >> Cargo.toml
-          export CARGO_TARGET_DIR=/tmp/probe-lc/target
-          cargo build -vv --target aarch64-unknown-linux-musl 2>&1 | grep -E "bcm\.c|std=|aws-lc-sys" | head -40
+          echo 'aws-lc-sys = "0.45.0"' >> Cargo.toml
+          cargo build --target aarch64-unknown-linux-musl 2>&1 | tail -3
+          OUT=$(find target/aarch64-unknown-linux-musl -name "out" -type d | head -1)
+          echo "OUT=$OUT"
+          echo "=== objets contenant __isoc23:"
+          for o in $(find $OUT -name "*.o" 2>/dev/null); do
+            if nm -C "$o" 2>/dev/null | grep -q isoc23; then
+              echo ">>> $o"
+              nm "$o" | grep isoc23 | head -4
+            fi
+          done
+          echo "=== jitter objects:"
+          find $OUT -name "*jitter*" | head
