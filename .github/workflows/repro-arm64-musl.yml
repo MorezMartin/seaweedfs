@@ -1,105 +1,22 @@
-name: "repro: arm64 musl cross build on noble"
-
+name: "micro: glibc redirect probe"
 on:
   push:
     branches: [ repro-arm64-musl-noble ]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-
-  broken-current-setup:
+  probe:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-      - name: Install cross-compilation tools (arm64)
+      - name: Install cross gcc
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Probe sscanf/strtol symbol per -std
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          echo "CFLAGS_aarch64_unknown_linux_musl=-U_FORTIFY_SOURCE" >> "$GITHUB_ENV"
-      - name: Use the vendored protoc
-        run: |
-          cd seaweed-worker
-          cargo fetch
-          version=$(awk '/^name = "protoc-bin-vendored-linux-x86_64"$/{found=1; next} found && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
-          test -n "$version" || { echo "protoc-bin-vendored-linux-x86_64 is not in Cargo.lock" >&2; exit 1; }
-          protoc=$(find ~/.cargo/registry/src -path "*protoc-bin-vendored-linux-x86_64-$version/bin/protoc" | head -1)
-          test -x "$protoc" || { echo "no vendored protoc $version in the registry" >&2; exit 1; }
-          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
-      - name: Build normal variant
-        env:
-          SEAWEEDFS_COMMIT: ${{ github.sha }}
-        run: |
-          cd seaweed-volume
-          cargo build --release --target aarch64-unknown-linux-musl --no-default-features
-
-  fix-a-clang-rustlld:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-      - name: Install LLVM tools
-        run: sudo apt-get install -y clang llvm lld
-      - name: Use the vendored protoc
-        run: |
-          cd seaweed-worker
-          cargo fetch
-          version=$(awk '/^name = "protoc-bin-vendored-linux-x86_64"$/{found=1; next} found && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
-          test -n "$version" || { echo "protoc-bin-vendored-linux-x86_64 is not in Cargo.lock" >&2; exit 1; }
-          protoc=$(find ~/.cargo/registry/src -path "*protoc-bin-vendored-linux-x86_64-$version/bin/protoc" | head -1)
-          test -x "$protoc" || { echo "no vendored protoc $version in the registry" >&2; exit 1; }
-          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
-      - name: Build normal variant (clang + rust-lld)
-        env:
-          SEAWEEDFS_COMMIT: ${{ github.sha }}
-          CC_aarch64_unknown_linux_musl: clang
-          AR_aarch64_unknown_linux_musl: llvm-ar
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-Clink-self-contained=yes -Clinker=rust-lld"
-        run: |
-          cd seaweed-volume
-          cargo build --release --target aarch64-unknown-linux-musl --no-default-features
-
-  fix-b-muslcc:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-      - name: Install musl.cc cross toolchain (arm64)
-        run: |
-          curl -fsSL https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl.tgz
-          sudo mkdir -p /opt/musl
-          sudo tar -xzf /tmp/musl.tgz -C /opt/musl
-          echo "/opt/musl/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-      - name: Use the vendored protoc
-        run: |
-          cd seaweed-worker
-          cargo fetch
-          version=$(awk '/^name = "protoc-bin-vendored-linux-x86_64"$/{found=1; next} found && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock)
-          test -n "$version" || { echo "protoc-bin-vendored-linux-x86_64 is not in Cargo.lock" >&2; exit 1; }
-          protoc=$(find ~/.cargo/registry/src -path "*protoc-bin-vendored-linux-x86_64-$version/bin/protoc" | head -1)
-          test -x "$protoc" || { echo "no vendored protoc $version in the registry" >&2; exit 1; }
-          echo "PROTOC=$protoc" >> "$GITHUB_ENV"
-      - name: Build normal variant (musl.cc toolchain)
-        env:
-          SEAWEEDFS_COMMIT: ${{ github.sha }}
-          CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-          AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-        run: |
-          cd seaweed-volume
-          cargo build --release --target aarch64-unknown-linux-musl --no-default-features
+          printf '#include <stdio.h>\n#include <stdlib.h>\nint f(const char*s){int i=0; sscanf(s,"%%d",&i); long l=0; l=strtol(s,0,10); return i+(int)l;}\n' > t.c
+          for std in "" "-std=c99" "-std=c11" "-std=gnu17" "-std=c2x" "-std=gnu2x"; do
+            aarch64-linux-gnu-gcc $std -c t.c -o t.o 2>/dev/null
+            printf "%-12s -> " "${std:-default}"; nm t.o | grep -E "isoc23_sscanf| U sscanf|isoc23_strtol| U strtol" | tr '\n' ' '; echo
+          done
+          echo "--- gcc version:"; aarch64-linux-gnu-gcc --version | head -1
+          echo "--- glibc cross headers:"; dpkg -l libc6-dev-arm64-cross | tail -1
