@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -22,7 +23,19 @@ func (f *Filer) appendToFile(ctx context.Context, targetFile string, data []byte
 	// expired shutdown deadline does not strand the chunk.
 	ctx = context.WithoutCancel(ctx)
 
-	// find out existing entry
+	return f.commitAppendedChunk(ctx, targetFile, assignResult.Fid, uploadResult)
+}
+
+// commitAppendedChunk attaches an already-uploaded chunk to its filer entry.
+//
+// From here on the chunk is durable on a volume server. Any early return must
+// therefore release it, otherwise it stays orphaned forever: nothing else
+// references this fid, so no later delete can ever mark it, and volume.fsck is
+// the only way to reclaim the space. This is especially visible for the system
+// metadata log, which is appended to on every filer write while filers are
+// being restarted — that is how a cluster with a few hundred MB of live logs
+// ends up carrying tens of GB of "live" volume data.
+func (f *Filer) commitAppendedChunk(ctx context.Context, targetFile, fid string, uploadResult *operation.UploadResult) error {
 	fullpath := util.FullPath(targetFile)
 	entry, err := f.FindEntry(ctx, fullpath)
 	var offset int64 = 0
@@ -38,16 +51,20 @@ func (f *Filer) appendToFile(ctx context.Context, targetFile string, data []byte
 			},
 		}
 	} else if err != nil {
+		f.deleteOrphanChunk(fid)
 		return fmt.Errorf("find %s: %v", fullpath, err)
 	} else {
 		offset = int64(TotalSize(entry.GetChunks()))
 	}
 
 	// append to existing chunks
-	entry.Chunks = append(entry.GetChunks(), uploadResult.ToPbFileChunk(assignResult.Fid, offset, time.Now().UnixNano()))
+	entry.Chunks = append(entry.GetChunks(), uploadResult.ToPbFileChunk(fid, offset, time.Now().UnixNano()))
 
 	// update the entry
 	err = f.CreateEntry(ctx, entry, nil, false, false, nil, false, f.MaxFilenameLength)
+	if err != nil {
+		f.deleteOrphanChunk(fid)
+	}
 
 	return err
 }
@@ -118,3 +135,38 @@ func (f *Filer) assignAndUpload(ctx context.Context, targetFile string, data []b
 	// println("uploaded to", targetUrl)
 	return assignResult, uploadResult, nil
 }
+
+// deleteOrphanChunk releases a chunk that was uploaded but whose filer entry
+// could not be committed. Without this the chunk stays on the volume server
+// with no entry pointing at it: the garbage collector only reclaims chunks that
+// were explicitly deleted, so the space is lost until an operator runs
+// volume.fsck.
+//
+// Failures are logged, never returned: the caller is already handling the
+// original error, and a failed cleanup must not mask it. A chunk that survives
+// here is still recoverable through volume.fsck.
+func (f *Filer) deleteOrphanChunk(fid string) {
+	if fid == "" {
+		return
+	}
+	if releaseOrphanChunkHook != nil {
+		releaseOrphanChunkHook(fid)
+		return
+	}
+	// Detach from the caller's context: it is often already cancelled (that is
+	// frequently why the entry commit failed), and the cleanup must still run.
+	ctx := context.WithoutCancel(context.Background())
+	lookupFunc := func(vids []string) (map[string]*operation.LookupResult, error) {
+		return operation.LookupVolumeIds(f.GetMaster, f.GrpcDialOption, vids)
+	}
+	results := operation.DeleteFileIdsWithLookupVolumeId(ctx, f.GrpcDialOption, []string{fid}, lookupFunc)
+	for _, result := range results {
+		if result.Error != "" {
+			glog.Warningf("failed to release orphan chunk %s: %s", fid, result.Error)
+		}
+	}
+}
+
+// releaseOrphanChunkHook lets tests observe orphan-chunk cleanup without a
+// master and volume server. Nil in production.
+var releaseOrphanChunkHook func(fid string)
