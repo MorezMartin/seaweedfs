@@ -35,6 +35,9 @@ type stubFilerStore struct {
 	entries         map[string]*Entry
 	kv              map[string][]byte
 	insertErr       error
+	// insertErrAfterStore stores the entry, then returns this error — the
+	// parent-directory failure path, where the entry survives its commit.
+	insertErrAfterStore error
 	findErr         error
 	findErrByPath   map[string]error
 	kvPutErr        error
@@ -186,7 +189,7 @@ func (s *stubFilerStore) InsertEntry(_ context.Context, entry *Entry) error {
 		return s.insertErr
 	}
 	s.entries[string(entry.FullPath)] = entry
-	return nil
+	return s.insertErrAfterStore
 }
 
 func (s *stubFilerStore) UpdateEntry(_ context.Context, entry *Entry) error {

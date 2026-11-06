@@ -6,7 +6,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -51,22 +50,52 @@ func (f *Filer) commitAppendedChunk(ctx context.Context, targetFile, fid string,
 			},
 		}
 	} else if err != nil {
-		f.deleteOrphanChunk(fid)
+		// The chunk is uploaded but the lookup failed, so no commit will
+		// happen and nothing will ever reference it. Release it here;
+		// returning early used to strand one chunk per retry.
+		f.releaseChunkIfUnreferenced(ctx, fullpath, uploadResult.ToPbFileChunk(fid, offset, time.Now().UnixNano()))
 		return fmt.Errorf("find %s: %v", fullpath, err)
 	} else {
 		offset = int64(TotalSize(entry.GetChunks()))
 	}
 
 	// append to existing chunks
-	entry.Chunks = append(entry.GetChunks(), uploadResult.ToPbFileChunk(fid, offset, time.Now().UnixNano()))
+	chunk := uploadResult.ToPbFileChunk(fid, offset, time.Now().UnixNano())
+	entry.Chunks = append(entry.GetChunks(), chunk)
 
 	// update the entry
 	err = f.CreateEntry(ctx, entry, nil, false, false, nil, false, f.MaxFilenameLength)
 	if err != nil {
-		f.deleteOrphanChunk(fid)
+		f.releaseChunkIfUnreferenced(ctx, fullpath, chunk)
 	}
 
 	return err
+}
+
+// releaseOrphanChunkHook observes chunk releases in tests. Production leaves
+// it nil.
+var releaseOrphanChunkHook func(fid string)
+
+// releaseChunkIfUnreferenced deletes an uploaded chunk only when the stored
+// entry does not reference it. A missing entry means nothing points at the
+// chunk, so it is released. When the entry exists but cannot be read the chunk
+// is kept: deleting data a stored entry may point at is worse than leaking it.
+func (f *Filer) releaseChunkIfUnreferenced(ctx context.Context, fullpath util.FullPath, chunk *filer_pb.FileChunk) {
+	stored, err := f.FindEntry(ctx, fullpath)
+	if err != nil && err != filer_pb.ErrNotFound {
+		return
+	}
+	if stored != nil {
+		for _, c := range stored.GetChunks() {
+			if c.GetFileId() == chunk.GetFileId() {
+				return
+			}
+		}
+	}
+	if releaseOrphanChunkHook != nil {
+		releaseOrphanChunkHook(chunk.GetFileId())
+	}
+	f.DeleteChunks(ctx, fullpath, []*filer_pb.FileChunk{chunk})
 }
 
 // resolveMetadataLogAssignDiskType returns the disk type and matched path rule for
@@ -136,37 +165,3 @@ func (f *Filer) assignAndUpload(ctx context.Context, targetFile string, data []b
 	return assignResult, uploadResult, nil
 }
 
-// deleteOrphanChunk releases a chunk that was uploaded but whose filer entry
-// could not be committed. Without this the chunk stays on the volume server
-// with no entry pointing at it: the garbage collector only reclaims chunks that
-// were explicitly deleted, so the space is lost until an operator runs
-// volume.fsck.
-//
-// Failures are logged, never returned: the caller is already handling the
-// original error, and a failed cleanup must not mask it. A chunk that survives
-// here is still recoverable through volume.fsck.
-func (f *Filer) deleteOrphanChunk(fid string) {
-	if fid == "" {
-		return
-	}
-	if releaseOrphanChunkHook != nil {
-		releaseOrphanChunkHook(fid)
-		return
-	}
-	// Detach from the caller's context: it is often already cancelled (that is
-	// frequently why the entry commit failed), and the cleanup must still run.
-	ctx := context.WithoutCancel(context.Background())
-	lookupFunc := func(vids []string) (map[string]*operation.LookupResult, error) {
-		return operation.LookupVolumeIds(f.GetMaster, f.GrpcDialOption, vids)
-	}
-	results := operation.DeleteFileIdsWithLookupVolumeId(ctx, f.GrpcDialOption, []string{fid}, lookupFunc)
-	for _, result := range results {
-		if result.Error != "" {
-			glog.Warningf("failed to release orphan chunk %s: %s", fid, result.Error)
-		}
-	}
-}
-
-// releaseOrphanChunkHook lets tests observe orphan-chunk cleanup without a
-// master and volume server. Nil in production.
-var releaseOrphanChunkHook func(fid string)
