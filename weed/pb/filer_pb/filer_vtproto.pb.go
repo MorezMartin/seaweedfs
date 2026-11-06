@@ -535,6 +535,16 @@ func (m *EventNotification) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.MetadataEventChunksTruncated {
+		i--
+		if m.MetadataEventChunksTruncated {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x38
+	}
 	if len(m.Signatures) > 0 {
 		var pksize2 int
 		for _, num := range m.Signatures {
@@ -5977,10 +5987,6 @@ func (m *StreamMutateEntryRequest_CreateRequest) MarshalToSizedBufferVT(dAtA []b
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
 		i--
 		dAtA[i] = 0x12
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
-		i--
-		dAtA[i] = 0x12
 	}
 	return len(dAtA) - i, nil
 }
@@ -5998,10 +6004,6 @@ func (m *StreamMutateEntryRequest_UpdateRequest) MarshalToSizedBufferVT(dAtA []b
 		}
 		i -= size
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
-		i--
-		dAtA[i] = 0x1a
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
 		i--
 		dAtA[i] = 0x1a
 	}
@@ -6023,10 +6025,6 @@ func (m *StreamMutateEntryRequest_DeleteRequest) MarshalToSizedBufferVT(dAtA []b
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
 		i--
 		dAtA[i] = 0x22
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
-		i--
-		dAtA[i] = 0x22
 	}
 	return len(dAtA) - i, nil
 }
@@ -6044,10 +6042,6 @@ func (m *StreamMutateEntryRequest_RenameRequest) MarshalToSizedBufferVT(dAtA []b
 		}
 		i -= size
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
-		i--
-		dAtA[i] = 0x2a
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
 		i--
 		dAtA[i] = 0x2a
 	}
@@ -6138,10 +6132,6 @@ func (m *StreamMutateEntryResponse_CreateResponse) MarshalToSizedBufferVT(dAtA [
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
 		i--
 		dAtA[i] = 0x1a
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
-		i--
-		dAtA[i] = 0x1a
 	}
 	return len(dAtA) - i, nil
 }
@@ -6159,10 +6149,6 @@ func (m *StreamMutateEntryResponse_UpdateResponse) MarshalToSizedBufferVT(dAtA [
 		}
 		i -= size
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
-		i--
-		dAtA[i] = 0x22
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
 		i--
 		dAtA[i] = 0x22
 	}
@@ -6184,10 +6170,6 @@ func (m *StreamMutateEntryResponse_DeleteResponse) MarshalToSizedBufferVT(dAtA [
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
 		i--
 		dAtA[i] = 0x2a
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
-		i--
-		dAtA[i] = 0x2a
 	}
 	return len(dAtA) - i, nil
 }
@@ -6205,10 +6187,6 @@ func (m *StreamMutateEntryResponse_RenameResponse) MarshalToSizedBufferVT(dAtA [
 		}
 		i -= size
 		i = protohelpers.EncodeVarint(dAtA, i, uint64(size))
-		i--
-		dAtA[i] = 0x32
-	} else {
-		i = protohelpers.EncodeVarint(dAtA, i, 0)
 		i--
 		dAtA[i] = 0x32
 	}
@@ -6882,6 +6860,9 @@ func (m *EventNotification) SizeVT() (n int) {
 			l += protohelpers.SizeOfVarint(uint64(e))
 		}
 		n += 1 + protohelpers.SizeOfVarint(uint64(l)) + l
+	}
+	if m.MetadataEventChunksTruncated {
+		n += 2
 	}
 	n += len(m.unknownFields)
 	return n
@@ -9031,8 +9012,6 @@ func (m *StreamMutateEntryRequest_CreateRequest) SizeVT() (n int) {
 	if m.CreateRequest != nil {
 		l = m.CreateRequest.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9045,8 +9024,6 @@ func (m *StreamMutateEntryRequest_UpdateRequest) SizeVT() (n int) {
 	if m.UpdateRequest != nil {
 		l = m.UpdateRequest.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9059,8 +9036,6 @@ func (m *StreamMutateEntryRequest_DeleteRequest) SizeVT() (n int) {
 	if m.DeleteRequest != nil {
 		l = m.DeleteRequest.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9073,8 +9048,6 @@ func (m *StreamMutateEntryRequest_RenameRequest) SizeVT() (n int) {
 	if m.RenameRequest != nil {
 		l = m.RenameRequest.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9113,8 +9086,6 @@ func (m *StreamMutateEntryResponse_CreateResponse) SizeVT() (n int) {
 	if m.CreateResponse != nil {
 		l = m.CreateResponse.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9127,8 +9098,6 @@ func (m *StreamMutateEntryResponse_UpdateResponse) SizeVT() (n int) {
 	if m.UpdateResponse != nil {
 		l = m.UpdateResponse.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9141,8 +9110,6 @@ func (m *StreamMutateEntryResponse_DeleteResponse) SizeVT() (n int) {
 	if m.DeleteResponse != nil {
 		l = m.DeleteResponse.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -9155,8 +9122,6 @@ func (m *StreamMutateEntryResponse_RenameResponse) SizeVT() (n int) {
 	if m.RenameResponse != nil {
 		l = m.RenameResponse.SizeVT()
 		n += 1 + l + protohelpers.SizeOfVarint(uint64(l))
-	} else {
-		n += 3
 	}
 	return n
 }
@@ -10954,6 +10919,26 @@ func (m *EventNotification) UnmarshalVT(dAtA []byte) error {
 			} else {
 				return fmt.Errorf("proto: wrong wireType = %d for field Signatures", wireType)
 			}
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MetadataEventChunksTruncated", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.MetadataEventChunksTruncated = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
